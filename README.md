@@ -26,7 +26,7 @@ Einweg-Synchronisationsskript (PC → Cloud) für den offiziellen `proton-drive`
 ## Verwendung
 
 ```bash
-git clone <REPO-URL>
+git clone https://github.com/Valyrian-Sol/proton-sync.git
 cd proton-sync
 
 # 1. Trockenlauf (Dry-Run): Zeigt genau an, was hochgeladen oder aktualisiert würde
