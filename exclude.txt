@@ -1,0 +1,15 @@
+# Ausschlussliste für die Proton Drive Synchronisation
+# Eine Zeile pro auszuschließendem Ordner. Zeilen mit '#' werden ignoriert.
+#
+# Unterstützte Formate:
+# 1. Einfacher Ordnername oder Glob-Muster (gilt auf jeder Ebene):
+#    Videos
+#    node_modules
+#    __pycache__
+#
+# 2. Relativer Pfad ab ~/Dokumente (bzw. ~/Documents) oder ~/Zotero:
+#    Projekte/Archiv
+#    Zotero/locate
+#
+# 3. Absoluter Pfad oder ~/...-Pfad:
+#    ~/Dokumente/Temp
