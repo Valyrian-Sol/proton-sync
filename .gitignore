@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 
+# Persönliche Ausschlusslisten (OPSEC: niemals echte private Ordnernamen committen!)
+/exclude.txt
+/exclude.local.txt
+*.lock
+
 # Betriebssystem- & Editor-Dateien
 .DS_Store
 Thumbs.db

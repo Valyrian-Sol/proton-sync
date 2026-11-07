@@ -7,21 +7,23 @@ Einweg-Synchronisationsskript (PC → Cloud) für den offiziellen `proton-drive`
 ## Voraussetzungen
 
 - Python 3.9+ (keine externen Python-Abhängigkeiten nötig)
-- Installierter und angemeldeter `proton-drive` CLI-Client (`proton-drive account status`)
+- Installierter und angemeldeter `proton-drive` CLI-Client (`proton-drive auth login`)
 
-## Funktionsweise & Garantien
+## Funktionsweise & Sicherheitsgarantien
 
 1. **Quellen & Ziele (konfigurierbar über `--dokumente` und `--zotero`):**
    - Alle **Unterordner** in `~/Dokumente/<Ordner>` (bzw. `~/Documents/<Ordner>`) werden nach `/my-files/<Ordner>` synchronisiert.
    - **Lose Dateien** direkt in `~/Dokumente` (z. B. `~/Dokumente/Notiz.txt`) werden **ignoriert** (`~/Dokumente` selbst wird nicht als Überordner angelegt).
-   - Der Ordner `~/Zotero` wird komplett nach `/my-files/Zotero` synchronisiert.
-2. **Ordner ausschließen:**
-   - Über `--exclude` / `-x`, die Datei [`exclude.txt`](exclude.txt) oder die Liste `DEFAULT_EXCLUDED_FOLDERS` in [`sync_proton_drive.py`](sync_proton_drive.py) lassen sich beliebige Top-Level- oder Unterordner ausschließen (per Ordnername wie `Videos`, `node_modules`, relativem Pfad wie `Projekte/Archiv` oder absolutem Pfad wie `~/Dokumente/Videos`).
-3. **Synchronisations-Regeln:**
-   - **Neue Ordner & Dateien:** Werden automatisch in die entsprechenden Zielordner hochgeladen. Existiert ein ganzer Ordner noch nicht in der Cloud (und enthält er keine ausgeschlossenen Unterordner), wird er in einem einzigen Schritt komplett übertragen.
-   - **Cloud älter als PC:** Ist eine Datei auf dem PC neuer (`mtime` > `claimedModificationTime` der Cloud-Datei) und weicht der Inhalt (`SHA-1`) ab, wird die Cloud-Datei durch die PC-Version aktualisiert (`-f create-new-revision -d merge`).
-   - **Cloud neuer oder gleich alt / inhaltsgleich:** Dateien, die in der Cloud neuer sind oder denselben `SHA-1`-Hash besitzen, werden übersprungen.
-   - **Kein Datenverlust:** Das Skript führt **niemals** Löschbefehle (`delete`/`trash`) aus und nutzt für Ordner immer `-d merge` sowie für aktualisierte Dateien `-f create-new-revision` (legt eine neue Revision in Proton Drive an, ohne bestehende Dateien zu verwerfen).
+   - Der Ordner `~/Zotero` wird nach `/my-files/Zotero` synchronisiert (geöffnete `zotero.sqlite`-Datenbanken werden automatisch erkannt und übersprungen, um korrupte Backups zu verhindern).
+2. **Ordner & Dateien ausschließen (Fail-Closed & OPSEC-sicher):**
+   - Über `--exclude` / `-x`, eine lokale `exclude.txt` (Vorlage: [`exclude.example.txt`](exclude.example.txt), per `.gitignore` vor versehentlichen Git-Commits geschützt), `~/.config/proton-sync/exclude.txt` oder `DEFAULT_EXCLUDED_FOLDERS` in [`sync_proton_drive.py`](sync_proton_drive.py) lassen sich beliebige Ordner **und Einzeldateien** ausschließen (z. B. `Videos`, `node_modules`, `*.kdbx`, `Projekte/Archiv` oder `~/Dokumente/Temp`).
+   - Fehlt eine explizit per `--exclude-file` angegebene Datei oder ist eine Ausschlussdatei unlesbar, bricht das Skript sofort ab (**Fail-Closed**), statt ungeschützt hochzuladen.
+   - Auch in komplett neuen Ordnern werden versteckte Dateien (`.env`, `.git` usw., sofern nicht `--include-hidden` gesetzt ist), Symlinks und ausgeschlossene Dateien niemals ungefiltert hochgeladen.
+3. **Synchronisations-Regeln & Härtung:**
+   - **Neue Ordner & Dateien:** Werden automatisch in die entsprechenden Zielordner unter `/my-files` hochgeladen.
+   - **Cloud älter als PC:** Ist eine Datei auf dem PC neuer (`mtime` > `claimedModificationTime` der Cloud-Datei) und weicht der Inhalt ab, wird die Cloud-Datei durch die PC-Version aktualisiert (`-f create-new-revision -d merge`).
+   - **Cloud neuer oder gleich alt / inhaltsgleich:** Dateien, die in der Cloud neuer sind oder denselben Hash besitzen, werden übersprungen (unplausible Zukunfts-Zeitstempel in Cloud-Metadaten werden erkannt und gemeldet).
+   - **Kein Datenverlust & Prozessschutz:** Das Skript führt **niemals** Löschbefehle (`delete`/`trash`) aus, schützt parallele Läufe per `flock`, prüft Pfade unmittelbar vor dem Upload gegen Symlink-Races (TOCTOU) und übergibt Dateipfade strikt hinter `--`.
 
 ## Verwendung
 
@@ -29,20 +31,20 @@ Einweg-Synchronisationsskript (PC → Cloud) für den offiziellen `proton-drive`
 git clone https://github.com/Valyrian-Sol/proton-sync.git
 cd proton-sync
 
+# Optional: Eigene lokale Ausschlussdatei anlegen (wird nicht in Git eingecheckt)
+cp exclude.example.txt exclude.txt
+
 # 1. Trockenlauf (Dry-Run): Zeigt genau an, was hochgeladen oder aktualisiert würde
 ./sync.sh --dry-run
 
-# 2. Bestimmte Ordner per Parameter ausschließen (-x mehrfach oder kommagetrennt)
-./sync.sh -x Videos -x Archiv --dry-run
+# 2. Bestimmte Ordner oder Dateimuster per Parameter ausschließen
+./sync.sh -x Videos -x "*.kdbx" --dry-run
 ./sync.sh --exclude "Videos,Projekte/Archiv,node_modules"
 
-# 3. Dauerhafte Ausschlüsse in exclude.txt eintragen (wird automatisch geladen)
-#    Datei: ./exclude.txt
-
-# 4. Live-Synchronisation starten (alle nicht ausgeschlossenen Unterordner von ~/Dokumente + ~/Zotero)
+# 3. Live-Synchronisation starten (alle nicht ausgeschlossenen Unterordner von ~/Dokumente + ~/Zotero)
 ./sync.sh
 
-# 5. Nur einen einzelnen Ordner gezielt synchronisieren (z. B. Zotero oder Projekte)
+# 4. Nur einen einzelnen Ordner gezielt synchronisieren (z. B. Zotero oder Projekte)
 ./sync.sh --only Zotero
 ./sync.sh --only Projekte -x Projekte/Archiv --dry-run
 ```

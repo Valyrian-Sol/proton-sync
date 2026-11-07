@@ -1,0 +1,23 @@
+# Beispiel-Ausschlussliste für die Proton Drive Synchronisation
+# Kopiere diese Vorlage nach `exclude.txt` (wird von Git ignoriert):
+#   cp exclude.example.txt exclude.txt
+#
+# Eine Zeile pro auszuschließendem Ordner oder Dateimuster.
+# Zeilen mit '#' sowie Leerzeilen werden ignoriert.
+#
+# Unterstützte Formate:
+# 1. Einfacher Ordner- oder Dateiname bzw. Glob-Muster (gilt auf jeder Ebene):
+#    Videos
+#    node_modules
+#    __pycache__
+#    *.kdbx
+#    *.pem
+#    *.key
+#
+# 2. Relativer Pfad ab ~/Dokumente (bzw. ~/Documents) oder ~/Zotero:
+#    Projekte/Archiv
+#    Zotero/locate
+#    Projekte/*.secret
+#
+# 3. Absoluter Pfad oder ~/...-Pfad:
+#    ~/Dokumente/Temp
