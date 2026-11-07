@@ -6,6 +6,7 @@ __pycache__/
 /exclude.txt
 /exclude.local.txt
 *.lock
+.proton-sync-stage-*
 
 # Betriebssystem- & Editor-Dateien
 .DS_Store
