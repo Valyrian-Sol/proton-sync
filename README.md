@@ -1,4 +1,4 @@
-# Proton Drive Sync (`~/Dokumente`-Unterordner & `~/Zotero`)
+# Proton Drive Sync (konfigurierbare Standardordner, z. B. `~/Dokumente`, `~/Zotero`, `~/.config`)
 
 > **🤖 Hinweis (KI-Projekt):** Dieses Projekt wurde mithilfe künstlicher Intelligenz (KI-gestützte Entwicklung) konzipiert und erstellt.
 
@@ -11,14 +11,18 @@ Einweg-Synchronisationsskript (PC → Cloud) für den offiziellen `proton-drive`
 
 ## Funktionsweise & Sicherheitsgarantien
 
-1. **Quellen & Ziele (konfigurierbar über `--dokumente` und `--zotero`):**
-   - Alle **Unterordner** in `~/Dokumente/<Ordner>` (bzw. `~/Documents/<Ordner>`) werden nach `/my-files/<Ordner>` synchronisiert.
-   - **Lose Dateien** direkt in `~/Dokumente` (z. B. `~/Dokumente/Notiz.txt`) werden **ignoriert** (`~/Dokumente` selbst wird nicht als Überordner angelegt).
-   - Der Ordner `~/Zotero` wird nach `/my-files/Zotero` synchronisiert (laufende Zotero-Prozesse sowie verwaiste `-wal`/`-journal`-Dateien werden minimal-invasiv erkannt und `zotero.sqlite*` wird übersprungen, um korrupte Backups zu verhindern).
-2. **Ordner & Dateien ausschließen (Fail-Closed, Case-/Unicode-robust & OPSEC-sicher):**
+1. **Quellen & Ziele (frei konfigurierbar über `sources.txt` & CLI):**
+   - **Standardpfade ab Werk:**
+     - Alle **Unterordner** in `~/Dokumente/<Ordner>` (bzw. `~/Documents/<Ordner>`, Modus `subfolders`) werden nach `/my-files/<Ordner>` synchronisiert; **lose Dateien** direkt in `~/Dokumente` werden ignoriert.
+     - Der Ordner `~/Zotero` (Modus `folder`) wird vollständig inkl. Unterordner und loser Dateien nach `/my-files/Zotero` synchronisiert (laufende Zotero-Prozesse sowie verwaiste `-wal`/`-journal`-Dateien werden minimal-invasiv erkannt und `zotero.sqlite*` wird übersprungen, um korrupte Backups zu verhindern).
+   - **Standardpfade hinzufügen oder entfernen:**
+     - Dauerhaft über `./sync.sh --add-source <PFAD>` (optional mit `--source-mode folder|subfolders`), `./sync.sh --remove-source <PFAD>`, `./sync.sh --list-sources` oder über `sources.txt` (Vorlage: [`sources.example.txt`](sources.example.txt), per `.gitignore` vor versehentlichen Git-Commits geschützt), `sources.local.txt` sowie `~/.config/proton-sync/sources.txt`.
+     - Einmalig pro Lauf über `--source` / `-s <PFAD>` bzw. `--skip-source <PFAD>`.
+     - Explizit als `folder`-Quelle konfigurierte Punkt-Ordner (wie `~/.config` → `/my-files/.config`) werden auch ohne `--include-hidden` inklusive aller nicht-versteckten Unterordner und loser Dateien synchronisiert (während versteckte Dateien *innerhalb* des Ordners wie `.env` weiterhin geschützt bleiben).
+2. **Ordner & Dateien ausschließen & Konfigurations-Schutz (Fail-Closed, Case-/Unicode-robust & OPSEC-sicher):**
    - Über `--exclude` / `-x`, eine lokale `exclude.txt` (Vorlage: [`exclude.example.txt`](exclude.example.txt), per `.gitignore` vor versehentlichen Git-Commits geschützt), `~/.config/proton-sync/exclude.txt` oder `DEFAULT_EXCLUDED_FOLDERS` in [`sync_proton_drive.py`](sync_proton_drive.py) lassen sich beliebige Ordner **und Einzeldateien** ausschließen (z. B. `Videos`, `node_modules`, `*.kdbx`, `Projekte/Archiv` oder `~/Dokumente/Temp`).
    - Der Abgleich ignoriert Groß-/Kleinschreibung sowie Unicode-Normalisierungsunterschiede (`NFC`/`NFD`), sodass `*.kdbx` zuverlässig auch `Tresor.KDBX` ausschließt.
-   - Fehlt eine explizit per `--exclude-file` angegebene Datei oder ist eine Ausschlussdatei unlesbar, bricht das Skript sofort ab (**Fail-Closed**), statt ungeschützt hochzuladen.
+   - Fehlt eine explizit per `--exclude-file` / `--sources-file` angegebene Datei, ist eine Konfigurationsdatei unlesbar, world-writable oder gehört einem fremden Benutzer, bricht das Skript sofort ab (**Fail-Closed**). `sources.txt` wird bei CLI-Änderungen atomar mit Modus `0600` und Symlink-Schutz geschrieben; Pfad-Traversierung (`..`), Wurzelpfad `/` und Steuerzeichen werden abgewiesen.
 3. **TOCTOU-freies Hardlink-Staging & Dateisystem-Grenzen:**
    - Versteckte Dateien (`.env`, `.git` usw., sofern nicht `--include-hidden` gesetzt ist), Symlinks, Hardlinks (`st_nlink > 1`, sofern nicht `--allow-hardlinks`) und fremde Dateisysteme/Mount-Points (sofern nicht `--cross-filesystems`) werden herausgefiltert.
    - `proton-drive` erhält niemals die echten Quellordner zum rekursiven Durchlaufen, sondern einen privaten Staging-Bereich (`0700`) aus Inode-geprüften Hardlinks. Selbst während eines laufenden Uploads nachträglich abgelegte Dateien oder Symlinks gelangen dadurch nicht in die Cloud.
@@ -50,6 +54,13 @@ cp exclude.example.txt exclude.txt
 # 4. Nur einen einzelnen Ordner gezielt synchronisieren (z. B. Zotero oder Projekte)
 ./sync.sh --only Zotero
 ./sync.sh --only Projekte -x Projekte/Archiv --dry-run
+
+# 5. Standardpfade anzeigen, hinzufügen oder entfernen
+./sync.sh --list-sources
+./sync.sh --add-source ~/.config
+./sync.sh --add-source ~/Projekte --source-mode subfolders
+./sync.sh --remove-source ~/Zotero
+./sync.sh --source ~/Bilder --skip-source ~/Zotero --dry-run
 ```
 
 ## Selbsttests ausführen

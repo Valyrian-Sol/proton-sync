@@ -21,7 +21,9 @@ from sync_proton_drive import (
     ScanPolicy,
     SingleInstanceLock,
     SyncAction,
+    SyncSource,
     SyncStats,
+    add_default_source,
     classify_entry,
     collect_sync_targets,
     escape_remote_segment,
@@ -31,8 +33,11 @@ from sync_proton_drive import (
     is_zotero_sqlite_in_use,
     join_remote_path,
     load_exclude_patterns,
+    load_sync_sources,
     parse_iso_timestamp,
+    parse_source_spec,
     plan_new_folder_with_exclusions,
+    remove_default_source,
     run_cli_streaming,
     safe_str,
     should_upload_existing_file,
@@ -273,6 +278,202 @@ class TestScanAndPlanning(unittest.TestCase):
             as_dir.mkdir()
             with self.assertRaises(IsADirectoryError):
                 load_exclude_patterns(exclude_file=as_dir)
+
+    def test_load_sync_sources_add_remove_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dok = root / "Dokumente"
+            zot = root / "Zotero"
+            cfg = root / ".config"
+            proj = root / "Projekte"
+            src_file = root / "sources.txt"
+            src_file.write_text(
+                f"# Kommentar\n{cfg}\nsubfolders:{proj}\n-{zot}\n",
+                encoding="utf-8",
+            )
+
+            active, removed = load_sync_sources(
+                dokumente_dir=dok,
+                zotero_dir=zot,
+                sources_file=src_file,
+                require_sources_file=True,
+                cli_add_sources=[f"folder:{root / 'Extra'}"],
+                cli_skip_sources=[str(proj)],
+            )
+            self.assertEqual(
+                [(s.path, s.mode) for s in active],
+                [(dok, "subfolders"), (cfg, "folder"), (root / "Extra", "folder")],
+            )
+            self.assertEqual(removed, [zot])
+
+            with self.assertRaises(FileNotFoundError):
+                load_sync_sources(
+                    dokumente_dir=dok,
+                    zotero_dir=zot,
+                    sources_file=root / "fehlt.txt",
+                    require_sources_file=True,
+                )
+            as_dir = root / "dir_sources"
+            as_dir.mkdir()
+            with self.assertRaises(IsADirectoryError):
+                load_sync_sources(
+                    dokumente_dir=dok,
+                    zotero_dir=zot,
+                    sources_file=as_dir,
+                )
+            with self.assertRaises(ValueError):
+                parse_source_spec("relativer/pfad")
+
+    def test_manage_default_sources_file_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dok = root / "Dokumente"
+            zot = root / "Zotero"
+            cfg = root / ".config"
+            src_file = root / "sources.txt"
+            defaults = [
+                SyncSource(path=dok, mode="subfolders", origin="default"),
+                SyncSource(path=zot, mode="folder", origin="default"),
+            ]
+
+            add_default_source(src_file, str(cfg), builtin_defaults=defaults)
+            self.assertEqual(os.stat(src_file).st_mode & 0o777, 0o600)
+            # Duplikat wird nicht doppelt eingetragen
+            add_default_source(src_file, str(cfg), builtin_defaults=defaults)
+            self.assertEqual(src_file.read_text(encoding="utf-8").splitlines().count(str(cfg)), 1)
+
+            # Eingebauten Standard entfernen -> -Pfad wird eingetragen
+            remove_default_source(src_file, str(zot), builtin_defaults=defaults)
+            active, removed = load_sync_sources(
+                dokumente_dir=dok, zotero_dir=zot, sources_file=src_file
+            )
+            self.assertEqual([s.path for s in active], [dok, cfg])
+            self.assertEqual(removed, [zot])
+
+            # Eingebauten Standard wieder aktivieren -> -Pfad verschwindet ohne Duplikat
+            add_default_source(src_file, str(zot), builtin_defaults=defaults)
+            active2, removed2 = load_sync_sources(
+                dokumente_dir=dok, zotero_dir=zot, sources_file=src_file
+            )
+            self.assertEqual([s.path for s in active2], [dok, zot, cfg])
+            self.assertEqual(removed2, [])
+
+            # Eigenen Pfad wieder entfernen -> verschwindet aus sources.txt
+            remove_default_source(src_file, str(cfg), builtin_defaults=defaults)
+            active3, _ = load_sync_sources(
+                dokumente_dir=dok, zotero_dir=zot, sources_file=src_file
+            )
+            self.assertEqual([s.path for s in active3], [dok, zot])
+
+    def test_dot_folder_source_includes_subfolders_and_loose_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / ".config"
+            (cfg / "gtk-3.0").mkdir(parents=True)
+            (cfg / "gtk-3.0" / "settings.ini").write_text("[Settings]", encoding="utf-8")
+            (cfg / "user-dirs.dirs").write_text("XDG_DOCUMENTS_DIR", encoding="utf-8")
+            (cfg / ".env").write_text("SECRET=1", encoding="utf-8")
+
+            stats = SyncStats()
+            targets = collect_sync_targets(
+                include_hidden=False,
+                stats=stats,
+                sources=[SyncSource(path=cfg, mode="folder", origin="file")],
+            )
+            self.assertEqual(len(targets), 1)
+            self.assertEqual(targets[0][2], ".config")
+
+            actions = plan_new_folder_with_exclusions(
+                local_dir=targets[0][0],
+                remote_parent=targets[0][1],
+                policy=ScanPolicy(include_hidden=False, base_dirs=[cfg]),
+                stats=stats,
+                remote_name=targets[0][2],
+            )
+            names = _member_names(actions)
+            self.assertIn("gtk-3.0", names)
+            self.assertIn("gtk-3.0/settings.ini", names)
+            self.assertIn("user-dirs.dirs", names)
+            self.assertNotIn(".env", names)
+
+    def test_collect_sync_targets_detects_remote_name_and_unicode_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "a" / unicodedata.normalize("NFC", "Büro")
+            b = root / "b" / unicodedata.normalize("NFD", "büro")
+            a.mkdir(parents=True)
+            b.mkdir(parents=True)
+
+            stats = SyncStats()
+            targets = collect_sync_targets(
+                sources=[
+                    SyncSource(path=a, mode="folder", origin="file"),
+                    SyncSource(path=b, mode="folder", origin="file"),
+                ],
+                stats=stats,
+            )
+            self.assertEqual(len(targets), 1)
+            self.assertTrue(any("Namenskollision" in e for e in stats.errors))
+
+    def test_cli_source_management_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dok = root / "Dokumente"
+            zot = root / "Zotero"
+            cfg = root / ".config"
+            dok.mkdir()
+            zot.mkdir()
+            cfg.mkdir()
+            src_file = root / "sources.txt"
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc1 = spd.main(
+                    [
+                        "--dokumente",
+                        str(dok),
+                        "--zotero",
+                        str(zot),
+                        "--sources-file",
+                        str(src_file),
+                        "--add-source",
+                        str(cfg),
+                    ]
+                )
+            self.assertEqual(rc1, 0)
+            self.assertIn(".config", out.getvalue())
+
+            out2 = io.StringIO()
+            with contextlib.redirect_stdout(out2):
+                rc2 = spd.main(
+                    [
+                        "--dokumente",
+                        str(dok),
+                        "--zotero",
+                        str(zot),
+                        "--sources-file",
+                        str(src_file),
+                        "--list-sources",
+                    ]
+                )
+            self.assertEqual(rc2, 0)
+            self.assertIn(str(cfg), out2.getvalue())
+
+            out3 = io.StringIO()
+            with contextlib.redirect_stdout(out3):
+                rc3 = spd.main(
+                    [
+                        "--dokumente",
+                        str(dok),
+                        "--zotero",
+                        str(zot),
+                        "--sources-file",
+                        str(src_file),
+                        "--remove-source",
+                        str(zot),
+                    ]
+                )
+            self.assertEqual(rc3, 0)
+            self.assertIn("Deaktivierte eingebaute Standardpfade", out3.getvalue())
 
 
 class TestUploadDecision(unittest.TestCase):
@@ -542,6 +743,55 @@ class TestHardening(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         with SingleInstanceLock(enabled=True):
                             pass
+
+    def test_parse_source_spec_blocks_injection_traversal_and_root(self) -> None:
+        for bad in (
+            "/tmp/a\n/etc",
+            "/tmp/a\r/etc",
+            "/tmp/a\x00b",
+            "/home/user/../etc",
+            "~/Dokumente/../../etc",
+            "/",
+            "folder:/",
+            "/tmp/../",
+        ):
+            with self.assertRaises(ValueError, msg=f"Hätte abgelehnt werden müssen: {bad!r}"):
+                parse_source_spec(bad)
+
+    def test_config_files_reject_world_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ex_file = root / "exclude.txt"
+            ex_file.write_text("Videos\n", encoding="utf-8")
+            os.chmod(ex_file, 0o666)
+            with self.assertRaises(PermissionError):
+                load_exclude_patterns(exclude_file=ex_file)
+
+            src_file = root / "sources.txt"
+            src_file.write_text(f"{root / 'Cfg'}\n", encoding="utf-8")
+            os.chmod(src_file, 0o666)
+            with self.assertRaises(PermissionError):
+                load_sync_sources(
+                    dokumente_dir=root / "Dok",
+                    zotero_dir=root / "Zot",
+                    sources_file=src_file,
+                )
+
+    def test_write_sources_file_blocks_symlink_clobber_and_enforces_0600(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim.txt"
+            victim.write_text("ORIGINAL", encoding="utf-8")
+            link_src = root / "sources.txt"
+            link_src.symlink_to(victim)
+
+            with self.assertRaises(PermissionError):
+                add_default_source(link_src, str(root / "Cfg"))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "ORIGINAL")
+
+            real_src = root / "real_sources.txt"
+            add_default_source(real_src, str(root / "Cfg"))
+            self.assertEqual(os.stat(real_src).st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

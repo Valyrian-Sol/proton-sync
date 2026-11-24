@@ -2,9 +2,12 @@
 __pycache__/
 *.py[cod]
 
-# Persönliche Ausschlusslisten (OPSEC: niemals echte private Ordnernamen committen!)
+# Persönliche Ausschluss- und Quellpfadlisten (OPSEC: niemals echte private Ordnernamen committen!)
 /exclude.txt
 /exclude.local.txt
+/sources.txt
+/sources.local.txt
+.sources-tmp-*
 *.lock
 .proton-sync-stage-*
 

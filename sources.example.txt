@@ -1,0 +1,29 @@
+# Beispiel-Konfigurationsdatei für Standard-Quellpfade (Proton Drive Sync)
+# Kopiere diese Vorlage nach `sources.txt` (wird von Git ignoriert) oder nutze:
+#   ./sync.sh --add-source ~/.config
+#   ./sync.sh --remove-source ~/Zotero
+#   ./sync.sh --list-sources
+#
+# Standardmäßig sind aktiv:
+#   - ~/Dokumente  (Modus: subfolders -> nur Unterordner, keine losen Dateien)
+#   - ~/Zotero     (Modus: folder     -> kompletter Ordner inkl. loser Dateien)
+#
+# Eine Zeile pro Eintrag. Zeilen mit '#' sowie Leerzeilen werden ignoriert.
+# Alle Pfade müssen absolut ('/...') oder relativ zu '~' ('~/...') sein.
+#
+# Unterstützte Formate:
+# 1. Kompletter Ordner inkl. aller Unterordner und loser Dateien (Standardmodus `folder`):
+#    ~/.config
+#    folder:~/Bilder
+#
+# 2. Nur Unterordner eines Ordners (lose Dateien direkt im Basisordner werden ignoriert):
+#    subfolders:~/Projekte
+#
+# 3. Eingebauten oder geerbten Standardpfad deaktivieren (führendes '-'):
+#    -~/Zotero
+#    -~/Dokumente
+#
+# Sicherheitshinweis (OPSEC) bei ~/.config:
+#   In ~/.config liegen häufig auch Browser-Profile oder CLI-Tokens (z. B. gh, rclone,
+#   proton-drive). Prüfe vor dem ersten Live-Upload mit `./sync.sh --dry-run` und
+#   schließe sensible Unterordner bei Bedarf in `exclude.txt` aus.

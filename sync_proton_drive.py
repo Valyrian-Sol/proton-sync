@@ -2,10 +2,14 @@
 """
 Proton Drive Sync-Script (Einweg-Synchronisation PC -> Proton Drive)
 
-Synchronisiert:
+Synchronisiert standardmäßig (über `sources.txt`, `sources.local.txt`,
+`~/.config/proton-sync/sources.txt` sowie `--add-source` / `--remove-source` /
+`--source` / `--skip-source` frei konfigurierbar):
 1. Alle Unterordner in ~/Dokumente -> /my-files/<Unterordner>
-   (lose Dateien direkt in ~/Dokumente werden ignoriert!)
+   (Modus `subfolders`: lose Dateien direkt in ~/Dokumente werden ignoriert!)
 2. Den Ordner ~/Zotero -> /my-files/Zotero
+   (Modus `folder`: kompletter Ordner inkl. Unterordner und loser Dateien)
+3. Optional weitere Standardordner (z. B. `~/.config` -> `/my-files/.config`)
 
 Regeln & Sicherheitsgarantien:
 - Bestimmte Ordner UND Einzeldateien können über `DEFAULT_EXCLUDED_FOLDERS`,
@@ -87,6 +91,10 @@ DEFAULT_ZOTERO = Path.home() / "Zotero"
 DEFAULT_EXCLUDE_FILE = Path(__file__).resolve().parent / "exclude.txt"
 DEFAULT_LOCAL_EXCLUDE_FILE = Path(__file__).resolve().parent / "exclude.local.txt"
 DEFAULT_USER_EXCLUDE_FILE = Path.home() / ".config" / "proton-sync" / "exclude.txt"
+DEFAULT_SOURCES_FILE = Path(__file__).resolve().parent / "sources.txt"
+DEFAULT_LOCAL_SOURCES_FILE = Path(__file__).resolve().parent / "sources.local.txt"
+DEFAULT_USER_SOURCES_FILE = Path.home() / ".config" / "proton-sync" / "sources.txt"
+VALID_SOURCE_MODES = ("folder", "subfolders")
 
 STAGING_PREFIX = ".proton-sync-stage-"
 MAX_WORKERS_LIMIT = 16
@@ -338,6 +346,13 @@ class SingleInstanceLock:
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SyncSource:
+    path: Path
+    mode: str = "folder"  # "folder" (kompletter Ordner inkl. loser Dateien) | "subfolders" (nur Unterordner)
+    origin: str = "default"
+
+
 @dataclass
 class RemoteNode:
     name: str
@@ -502,9 +517,11 @@ def _split_cli_exclude(raw: str) -> List[str]:
     return parts
 
 
-def _read_exclude_file_strict(file_path: Path, required: bool) -> List[str]:
+def _read_config_lines_strict(
+    file_path: Path, required: bool, label: str = "Konfigurationsdatei"
+) -> List[str]:
     """
-    Liest eine Ausschlussdatei nach dem Fail-Closed-Prinzip:
+    Liest eine Konfigurationsdatei (Ausschluss- oder Quellpfaddatei) nach dem Fail-Closed-Prinzip:
     - Fehlt eine optionale Standarddatei komplett, wird `[]` zurückgegeben.
     - Fehlt eine explizit angeforderte Datei (`required=True`) oder ist eine vorhandene
       Datei ein Verzeichnis, ein defekter Symlink oder nicht lesbar, wird ein Fehler ausgelöst.
@@ -516,18 +533,29 @@ def _read_exclude_file_strict(file_path: Path, required: bool) -> List[str]:
     if not exists and not is_link:
         if required:
             raise FileNotFoundError(
-                f"Angegebene Ausschlussdatei existiert nicht: {safe_str(expanded)}"
+                f"Angegebene {label} existiert nicht: {safe_str(expanded)}"
             )
         return []
 
     if is_link and not exists:
         raise FileNotFoundError(
-            f"Ausschlussdatei ist ein defekter Symlink: {safe_str(expanded)}"
+            f"{label} ist ein defekter Symlink: {safe_str(expanded)}"
         )
 
     if not expanded.is_file():
         raise IsADirectoryError(
-            f"Ausschlussdatei ist keine reguläre Datei: {safe_str(expanded)}"
+            f"{label} ist keine reguläre Datei: {safe_str(expanded)}"
+        )
+
+    st = os.stat(expanded)
+    allowed_uids = {0, os.geteuid()}
+    if st.st_uid not in allowed_uids:
+        raise PermissionError(
+            f"Unsicherer Eigentümer (UID {st.st_uid}) für {label}: {safe_str(expanded)}"
+        )
+    if st.st_mode & stat.S_IWOTH:
+        raise PermissionError(
+            f"Unsichere Dateirechte (world-writable) für {label}: {safe_str(expanded)}"
         )
 
     lines: List[str] = []
@@ -538,6 +566,11 @@ def _read_exclude_file_strict(file_path: Path, required: bool) -> List[str]:
             continue
         lines.append(line)
     return lines
+
+
+def _read_exclude_file_strict(file_path: Path, required: bool) -> List[str]:
+    """Liest eine Ausschlussdatei nach dem Fail-Closed-Prinzip."""
+    return _read_config_lines_strict(file_path, required=required, label="Ausschlussdatei")
 
 
 def load_exclude_patterns(
@@ -696,6 +729,305 @@ def is_excluded_folder(
 ) -> Tuple[bool, Optional[str]]:
     """Rückwärtskompatibler Alias für `is_excluded_path`."""
     return is_excluded_path(folder_path, exclude_patterns, base_dirs)
+
+
+# --------------------------------------------------------------------------------------
+# Konfigurierbare Standardpfade (Quellen)
+# --------------------------------------------------------------------------------------
+
+
+def _normalize_source_variants(path: Path) -> Set[str]:
+    """Liefert logische und aufgelöste Pfadvarianten zum robusten Abgleich."""
+    expanded_str = os.path.expanduser(str(path))
+    logical = os.path.abspath(expanded_str)
+    resolved = str(Path(expanded_str).resolve())
+    return {logical, resolved}
+
+
+def _sources_match(path_a: Path, path_b: Path) -> bool:
+    return bool(_normalize_source_variants(path_a) & _normalize_source_variants(path_b))
+
+
+def parse_source_spec(raw: str, default_mode: str = "folder") -> Tuple[str, Path, str]:
+    """
+    Parst eine Quellpfad-Angabe:
+    - Optionales führendes `-` entfernt den Pfad aus den Standardpfaden (`action="remove"`).
+    - Optionales Präfix `folder:` (kompletter Ordner inkl. loser Dateien) oder
+      `subfolders:` (nur Unterordner) bestimmt den Modus.
+    - Der Pfad muss absolut sein oder mit `~` beginnen (Fail-Closed gegen Tippfehler).
+    """
+    if default_mode not in VALID_SOURCE_MODES:
+        raise ValueError(f"Ungültiger Standardmodus: {safe_str(default_mode)}")
+
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise ValueError(
+            "Steuerzeichen oder Zeilenumbrüche im Quellpfad sind nicht erlaubt"
+        )
+
+    stripped = raw.strip()
+    if not stripped:
+        raise ValueError("Leerer Quellpfad ist nicht erlaubt")
+
+    action = "add"
+    body = stripped
+    if stripped.startswith("-"):
+        action = "remove"
+        body = stripped[1:].strip()
+
+    lower_body = body.lower()
+    if lower_body.startswith("folder:"):
+        mode = "folder"
+        path_str = body[len("folder:") :].strip()
+    elif lower_body.startswith("subfolders:"):
+        mode = "subfolders"
+        path_str = body[len("subfolders:") :].strip()
+    else:
+        mode = default_mode
+        path_str = body
+
+    if not path_str:
+        raise ValueError(f"Quellpfad fehlt in Angabe: {safe_str(raw)}")
+
+    if not (path_str.startswith("/") or path_str.startswith("~")):
+        raise ValueError(
+            f"Quellpfad muss absolut sein oder mit '~' beginnen: {safe_str(raw)}"
+        )
+
+    candidate = Path(path_str)
+    if ".." in candidate.parts:
+        raise ValueError(
+            f"Pfad-Traversierung ('..') im Quellpfad ist nicht erlaubt: {safe_str(raw)}"
+        )
+
+    expanded_path = os.path.expanduser(path_str)
+    abs_path = os.path.abspath(expanded_path)
+    resolved_path = str(Path(expanded_path).resolve())
+    if abs_path == "/" or resolved_path == "/":
+        raise ValueError(
+            "Das Wurzelverzeichnis '/' darf nicht als Quellpfad verwendet werden"
+        )
+
+    return action, candidate, mode
+
+
+def _read_sources_file_strict(file_path: Path, required: bool) -> List[str]:
+    """Liest eine Quellen-Datei nach dem Fail-Closed-Prinzip."""
+    return _read_config_lines_strict(file_path, required=required, label="Quellen-Datei")
+
+
+def load_sync_sources(
+    *,
+    dokumente_dir: Path = DEFAULT_DOKUMENTE,
+    zotero_dir: Path = DEFAULT_ZOTERO,
+    cli_add_sources: Optional[Sequence[str]] = None,
+    cli_skip_sources: Optional[Sequence[str]] = None,
+    sources_file: Optional[Path] = DEFAULT_SOURCES_FILE,
+    require_sources_file: bool = False,
+    extra_sources_files: Sequence[Path] = (),
+) -> Tuple[List[SyncSource], List[Path]]:
+    """
+    Lädt die aktiven Synchronisationsquellen aus:
+    1. Eingebauten Standardpfaden (`~/Dokumente` im Modus `subfolders`, `~/Zotero` im Modus `folder`)
+    2. `extra_sources_files` (optional, z. B. `~/.config/proton-sync/sources.txt`, `sources.local.txt`)
+    3. `sources_file` (standardmäßig `sources.txt` im Skript-Ordner; bei `--sources-file` Pflicht!)
+    4. `cli_add_sources` (`--source` / `-s`) und `cli_skip_sources` (`--skip-source`)
+
+    Gibt `(aktive_quellen, entfernte_standardpfade)` zurück.
+    """
+    builtin_defaults: List[SyncSource] = [
+        SyncSource(path=dokumente_dir, mode="subfolders", origin="default"),
+        SyncSource(path=zotero_dir, mode="folder", origin="default"),
+    ]
+    active: List[SyncSource] = list(builtin_defaults)
+    removed_defaults: List[Path] = []
+
+    def _apply_entry(raw_spec: str, origin: str, force_remove: bool = False) -> None:
+        action, path, mode = parse_source_spec(raw_spec, default_mode="folder")
+        if force_remove:
+            action = "remove"
+
+        if action == "add":
+            removed_defaults[:] = [p for p in removed_defaults if not _sources_match(p, path)]
+            for idx, existing in enumerate(active):
+                if _sources_match(existing.path, path):
+                    active[idx] = SyncSource(path=path, mode=mode, origin=origin)
+                    return
+            active.append(SyncSource(path=path, mode=mode, origin=origin))
+            return
+
+        # action == "remove"
+        active[:] = [src for src in active if not _sources_match(src.path, path)]
+        for builtin in builtin_defaults:
+            if _sources_match(builtin.path, path) and not any(
+                _sources_match(r, builtin.path) for r in removed_defaults
+            ):
+                removed_defaults.append(builtin.path)
+
+    for extra_file in extra_sources_files:
+        for line in _read_sources_file_strict(extra_file, required=False):
+            _apply_entry(line, origin=f"file:{extra_file.name}")
+
+    if sources_file is not None:
+        for line in _read_sources_file_strict(sources_file, required=require_sources_file):
+            _apply_entry(line, origin=f"file:{sources_file.name}")
+
+    if cli_add_sources:
+        for raw in cli_add_sources:
+            _apply_entry(raw, origin="cli")
+
+    if cli_skip_sources:
+        for raw in cli_skip_sources:
+            _apply_entry(raw, origin="cli", force_remove=True)
+
+    return active, removed_defaults
+
+
+def _format_source_entry(path_str: str, mode: str) -> str:
+    return f"subfolders:{path_str}" if mode == "subfolders" else path_str
+
+
+def _read_sources_raw_lines(file_path: Path) -> Tuple[List[str], bool]:
+    """Liest vorhandene Rohzeilen (inkl. Kommentaren) einer Quellen-Datei (Fail-Closed)."""
+    expanded = file_path.expanduser()
+    is_link = expanded.is_symlink()
+    if is_link:
+        raise PermissionError(
+            f"Quellen-Datei darf kein Symlink sein: {safe_str(expanded)}"
+        )
+    if not expanded.exists():
+        return [], False
+    if not expanded.is_file():
+        raise IsADirectoryError(f"Quellen-Datei ist keine reguläre Datei: {safe_str(expanded)}")
+    st = os.stat(expanded)
+    allowed_uids = {0, os.geteuid()}
+    if st.st_uid not in allowed_uids:
+        raise PermissionError(
+            f"Unsicherer Eigentümer (UID {st.st_uid}) für Quellen-Datei: {safe_str(expanded)}"
+        )
+    if st.st_mode & stat.S_IWOTH:
+        raise PermissionError(
+            f"Unsichere Dateirechte (world-writable) für Quellen-Datei: {safe_str(expanded)}"
+        )
+    return expanded.read_text(encoding="utf-8").splitlines(), True
+
+
+def _write_sources_file_lines(file_path: Path, lines: Sequence[str]) -> None:
+    """Schreibt die Quellen-Datei atomar mit Dateirechten 0600 und Symlink-Schutz."""
+    expanded = file_path.expanduser()
+    if expanded.is_symlink():
+        raise PermissionError(
+            f"Quellen-Datei darf kein Symlink sein: {safe_str(expanded)}"
+        )
+    if expanded.exists() and not expanded.is_file():
+        raise IsADirectoryError(
+            f"Quellen-Datei ist keine reguläre Datei: {safe_str(expanded)}"
+        )
+    expanded.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(lines) + ("\n" if lines else "")
+    fd, tmp_name = tempfile.mkstemp(prefix=".sources-tmp-", dir=str(expanded.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, expanded)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def add_default_source(
+    file_path: Path,
+    spec: str,
+    default_mode: str = "folder",
+    builtin_defaults: Sequence[SyncSource] = (),
+) -> str:
+    """Fügt einen Standardpfad dauerhaft zu `file_path` hinzu oder reaktiviert einen entfernten Standard."""
+    action, path, mode = parse_source_spec(spec, default_mode=default_mode)
+    if action != "add":
+        raise ValueError(
+            f"Zum Entfernen bitte '--remove-source' verwenden, nicht '{safe_str(spec)}'."
+        )
+
+    raw_lines, _ = _read_sources_raw_lines(file_path)
+    formatted_entry = _format_source_entry(str(path), mode)
+    matches_builtin_same_mode = any(
+        _sources_match(b.path, path) and b.mode == mode for b in builtin_defaults
+    )
+
+    new_lines: List[str] = []
+    replaced = False
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        try:
+            line_action, line_path, _ = parse_source_spec(stripped, default_mode="folder")
+        except ValueError:
+            new_lines.append(line)
+            continue
+        if _sources_match(line_path, path):
+            if line_action == "remove":
+                continue
+            if not matches_builtin_same_mode and not replaced:
+                new_lines.append(formatted_entry)
+                replaced = True
+            continue
+        new_lines.append(line)
+
+    if not matches_builtin_same_mode and not replaced:
+        new_lines.append(formatted_entry)
+
+    _write_sources_file_lines(file_path, new_lines)
+    return f"Standardpfad aktiviert: {safe_str(path)} (Modus: {mode})"
+
+
+def remove_default_source(
+    file_path: Path,
+    spec: str,
+    builtin_defaults: Sequence[SyncSource] = (),
+) -> str:
+    """Entfernt einen Standardpfad dauerhaft aus den aktiven Standardpfaden in `file_path`."""
+    cleaned = spec.strip()
+    if cleaned.startswith("-"):
+        cleaned = cleaned[1:].strip()
+    _, path, _ = parse_source_spec(cleaned, default_mode="folder")
+
+    raw_lines, _ = _read_sources_raw_lines(file_path)
+    is_builtin = any(_sources_match(b.path, path) for b in builtin_defaults)
+
+    new_lines: List[str] = []
+    has_remove_entry = False
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        try:
+            line_action, line_path, _ = parse_source_spec(stripped, default_mode="folder")
+        except ValueError:
+            new_lines.append(line)
+            continue
+        if _sources_match(line_path, path):
+            if line_action == "add":
+                continue
+            if line_action == "remove":
+                if not has_remove_entry and is_builtin:
+                    new_lines.append(line)
+                    has_remove_entry = True
+                continue
+        new_lines.append(line)
+
+    if is_builtin and not has_remove_entry:
+        new_lines.append(f"-{path}")
+
+    _write_sources_file_lines(file_path, new_lines)
+    return f"Standardpfad entfernt: {safe_str(path)}"
 
 
 # --------------------------------------------------------------------------------------
@@ -1034,88 +1366,122 @@ def list_remote_directory(
 
 
 def collect_sync_targets(
-    dokumente_dir: Path,
-    zotero_dir: Path,
-    include_hidden: bool,
-    stats: SyncStats,
+    dokumente_dir: Optional[Path] = None,
+    zotero_dir: Optional[Path] = None,
+    include_hidden: bool = False,
+    stats: Optional[SyncStats] = None,
     exclude_patterns: Sequence[str] = (),
     allowed_devs: FrozenSet[int] = frozenset(),
+    sources: Optional[Sequence[SyncSource]] = None,
 ) -> List[Tuple[Path, str, str]]:
     """
-    Bestimmt alle zu synchronisierenden Top-Level-Ordner unter Berücksichtigung
+    Bestimmt alle zu synchronisierenden Top-Level-Ordner aus `sources` (oder
+    rückwärtskompatibel aus `dokumente_dir` + `zotero_dir`) unter Berücksichtigung
     der Ausschlussliste `exclude_patterns` und erlaubter Dateisysteme (`allowed_devs`).
     Rückgabe: Liste von Tupeln (resolved_local_folder_path, remote_parent_path, folder_name)
     """
-    targets: List[Tuple[Path, str, str]] = []
-    raw_dok = dokumente_dir.expanduser()
-    raw_zot = zotero_dir.expanduser()
-    resolved_dok = raw_dok.resolve()
-    resolved_zot = raw_zot.resolve()
-    base_dirs = [raw_dok, raw_zot]
+    if stats is None:
+        stats = SyncStats()
 
-    if resolved_dok.exists() and resolved_dok.is_dir():
-        for entry in sorted(resolved_dok.iterdir(), key=lambda p: p.name.lower()):
-            if entry.name.startswith(STAGING_PREFIX):
-                continue
-            if entry.name.startswith(".") and not include_hidden:
-                continue
-            try:
-                st = os.lstat(entry)
-            except OSError as exc:
+    if sources is None:
+        effective_sources: List[SyncSource] = []
+        if dokumente_dir is not None:
+            effective_sources.append(
+                SyncSource(path=dokumente_dir, mode="subfolders", origin="default")
+            )
+        if zotero_dir is not None:
+            effective_sources.append(
+                SyncSource(path=zotero_dir, mode="folder", origin="default")
+            )
+    else:
+        effective_sources = list(sources)
+
+    targets: List[Tuple[Path, str, str]] = []
+    seen_targets: Dict[str, Path] = {}
+    base_dirs = [s.path.expanduser() for s in effective_sources]
+
+    def _add_target(local_path: Path, remote_parent: str, folder_name: str) -> None:
+        norm_key = normalize_for_match(folder_name)
+        if norm_key in seen_targets:
+            if seen_targets[norm_key] == local_path:
+                return
+            stats.errors.append(
+                f"Namenskollision im Cloud-Ziel '{safe_str(remote_parent)}/{safe_str(folder_name)}': "
+                f"{safe_str(seen_targets[norm_key])} vs. {safe_str(local_path)}"
+            )
+            return
+        seen_targets[norm_key] = local_path
+        targets.append((local_path, remote_parent, folder_name))
+
+    for source in effective_sources:
+        raw_src = source.path.expanduser()
+        resolved_src = raw_src.resolve()
+
+        if not (resolved_src.exists() and resolved_src.is_dir()):
+            stats.errors.append(f"Quellordner nicht gefunden: {safe_str(source.path)}")
+            continue
+
+        if source.mode == "subfolders":
+            for entry in sorted(resolved_src.iterdir(), key=lambda p: p.name.lower()):
+                if entry.name.startswith(STAGING_PREFIX):
+                    continue
+                if entry.name.startswith(".") and not include_hidden:
+                    continue
+                try:
+                    st = os.lstat(entry)
+                except OSError as exc:
+                    stats.errors.append(
+                        f"Konnte Element nicht prüfen {safe_str(entry)}: {safe_str(exc)}"
+                    )
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    stats.skipped_symlinks += 1
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    ok_name, reason = is_safe_node_name(entry.name)
+                    if not ok_name:
+                        stats.errors.append(
+                            f"Überspringe Top-Level-Ordner {safe_str(entry)}: {reason}"
+                        )
+                        continue
+                    if allowed_devs and st.st_dev not in allowed_devs:
+                        stats.warnings.append(
+                            f"Anderes Dateisystem / Mount-Point übersprungen: {safe_str(entry)} "
+                            "(--cross-filesystems zum Einbeziehen)"
+                        )
+                        continue
+                    excluded, matched = is_excluded_path(entry, exclude_patterns, base_dirs)
+                    if excluded:
+                        stats.excluded_folders.append((entry, matched or ""))
+                        continue
+                    _add_target(entry, REMOTE_ROOT, entry.name)
+                elif stat.S_ISREG(st.st_mode):
+                    stats.ignored_loose_files.append(entry)
+        else:
+            # source.mode == "folder": ganzer Ordner inkl. Unterordnern und loser Dateien
+            # (explizite Punkt-Ordner wie ~/.config werden auch ohne --include-hidden aufgenommen)
+            logical_name = (
+                raw_src.name
+                if raw_src.name and raw_src.name not in (".", "..")
+                else resolved_src.name
+            )
+            if logical_name.startswith(STAGING_PREFIX):
                 stats.errors.append(
-                    f"Konnte Element nicht prüfen {safe_str(entry)}: {safe_str(exc)}"
+                    f"Ungültiger Zielordnername mit reserviertem Präfix '{safe_str(logical_name)}' "
+                    f"(Pfad: {safe_str(source.path)})"
                 )
                 continue
-            if stat.S_ISLNK(st.st_mode):
-                stats.skipped_symlinks += 1
+            ok_name, reason = is_safe_node_name(logical_name)
+            if not ok_name:
+                stats.errors.append(
+                    f"Ungültiger Zielordnername '{safe_str(logical_name)}' (Pfad: {safe_str(source.path)}): {reason}"
+                )
                 continue
-            if stat.S_ISDIR(st.st_mode):
-                ok_name, reason = is_safe_node_name(entry.name)
-                if not ok_name:
-                    stats.errors.append(
-                        f"Überspringe Top-Level-Ordner {safe_str(entry)}: {reason}"
-                    )
-                    continue
-                if allowed_devs and st.st_dev not in allowed_devs:
-                    stats.warnings.append(
-                        f"Anderes Dateisystem / Mount-Point übersprungen: {safe_str(entry)} "
-                        "(--cross-filesystems zum Einbeziehen)"
-                    )
-                    continue
-                excluded, matched = is_excluded_path(entry, exclude_patterns, base_dirs)
-                if excluded:
-                    stats.excluded_folders.append((entry, matched or ""))
-                    continue
-                targets.append((entry, REMOTE_ROOT, entry.name))
-            elif stat.S_ISREG(st.st_mode):
-                stats.ignored_loose_files.append(entry)
-    else:
-        stats.errors.append(
-            f"Dokumente-Ordner nicht gefunden: {safe_str(dokumente_dir)}"
-        )
-
-    if resolved_zot.exists() and resolved_zot.is_dir():
-        # Falls ~/Zotero ein Symlink auf z. B. /mnt/data/zotero_profile ist, bleibt der Zielname "Zotero"
-        logical_zot_name = (
-            raw_zot.name
-            if raw_zot.name and raw_zot.name not in (".", "..")
-            else resolved_zot.name
-        )
-        ok_name, reason = is_safe_node_name(logical_zot_name)
-        if not ok_name:
-            stats.errors.append(
-                f"Ungültiger Zotero-Zielordnername '{safe_str(logical_zot_name)}' (Pfad: {safe_str(zotero_dir)}): {reason}"
-            )
-        else:
-            excluded, matched = is_excluded_path(
-                raw_zot, exclude_patterns, base_dirs
-            )
+            excluded, matched = is_excluded_path(raw_src, exclude_patterns, base_dirs)
             if excluded:
-                stats.excluded_folders.append((resolved_zot, matched or ""))
-            else:
-                targets.append((resolved_zot, REMOTE_ROOT, logical_zot_name))
-    else:
-        stats.errors.append(f"Zotero-Ordner nicht gefunden: {safe_str(zotero_dir)}")
+                stats.excluded_folders.append((resolved_src, matched or ""))
+                continue
+            _add_target(resolved_src, REMOTE_ROOT, logical_name)
 
     return targets
 
@@ -2001,8 +2367,8 @@ def execute_upload_batches(
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Synchronisiert alle Unterordner in ~/Dokumente (ohne lose Dateien) "
-            "sowie ~/Zotero mit Proton Drive (/my-files)."
+            "Synchronisiert konfigurierbare Standardordner (standardmäßig Unterordner von ~/Dokumente "
+            "sowie ~/Zotero) mit Proton Drive (/my-files)."
         )
     )
     parser.add_argument(
@@ -2016,6 +2382,67 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_ZOTERO,
         help=f"Pfad zum Zotero-Ordner (Standard: {DEFAULT_ZOTERO})",
+    )
+    parser.add_argument(
+        "--source",
+        "-s",
+        action="append",
+        default=[],
+        metavar="PFAD",
+        help=(
+            "Zusätzlicher Quellordner nur für diesen Lauf "
+            "(z. B. `~/.config`, `folder:/pfad` oder `subfolders:/pfad`)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-source",
+        action="append",
+        default=[],
+        metavar="PFAD",
+        help="Überspringt einen konfigurierten Standardpfad nur für diesen Lauf (z. B. `~/Zotero`).",
+    )
+    parser.add_argument(
+        "--sources-file",
+        type=Path,
+        default=None,
+        help=(
+            f"Explizite Datei mit Standardpfaden (Fail-Closed bei Nichtvorhandensein; "
+            f"Standard ohne Flag: {DEFAULT_SOURCES_FILE} falls vorhanden)."
+        ),
+    )
+    parser.add_argument(
+        "--list-sources",
+        action="store_true",
+        help="Zeigt alle aktiven Standardpfade (und deaktivierte Standardpfade) an und beendet das Skript.",
+    )
+    parser.add_argument(
+        "--add-source",
+        action="append",
+        default=[],
+        metavar="PFAD",
+        help=(
+            "Fügt einen Standardpfad dauerhaft zu sources.txt (bzw. --sources-file) hinzu "
+            "und beendet das Skript."
+        ),
+    )
+    parser.add_argument(
+        "--remove-source",
+        action="append",
+        default=[],
+        metavar="PFAD",
+        help=(
+            "Entfernt einen Standardpfad dauerhaft aus den aktiven Standardpfaden in sources.txt "
+            "(bzw. --sources-file) und beendet das Skript."
+        ),
+    )
+    parser.add_argument(
+        "--source-mode",
+        choices=list(VALID_SOURCE_MODES),
+        default="folder",
+        help=(
+            "Modus für `--add-source`: 'folder' (Standard, kompletter Ordner inkl. loser Dateien) "
+            "oder 'subfolders' (nur Unterordner)."
+        ),
     )
     parser.add_argument(
         "--exclude",
@@ -2122,8 +2549,91 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _print_sources_summary(
+    active_sources: Sequence[SyncSource],
+    removed_defaults: Sequence[Path],
+    sources_file: Path,
+) -> None:
+    print(f"Konfigurierte Standardpfade (Datei: {safe_str(sources_file)}):")
+    if not active_sources:
+        print("  (keine aktiven Standardpfade)")
+    for src in active_sources:
+        raw_src = src.path.expanduser()
+        logical_name = (
+            raw_src.name
+            if raw_src.name and raw_src.name not in (".", "..")
+            else raw_src.resolve().name
+        )
+        remote_target = (
+            f"{REMOTE_ROOT}/<Unterordner>"
+            if src.mode == "subfolders"
+            else f"{REMOTE_ROOT}/{logical_name}"
+        )
+        print(
+            f"  [+] {safe_str(src.path)}  [Modus: {src.mode}, Ziel: {safe_str(remote_target)}, Quelle: {safe_str(src.origin)}]"
+        )
+    if removed_defaults:
+        print("Deaktivierte eingebaute Standardpfade:")
+        for rem in removed_defaults:
+            print(f"  [-] {safe_str(rem)}")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    explicit_sources_file = args.sources_file is not None
+    effective_sources_file = (
+        args.sources_file if explicit_sources_file else DEFAULT_SOURCES_FILE
+    )
+    extra_sources_files = tuple(
+        f
+        for f in (DEFAULT_USER_SOURCES_FILE, DEFAULT_LOCAL_SOURCES_FILE)
+        if not _sources_match(f, effective_sources_file)
+    )
+
+    if args.add_source or args.remove_source or args.list_sources:
+        try:
+            inherited_sources, _ = load_sync_sources(
+                dokumente_dir=args.dokumente,
+                zotero_dir=args.zotero,
+                sources_file=None,
+                extra_sources_files=extra_sources_files,
+            )
+            for spec in args.remove_source:
+                print(
+                    remove_default_source(
+                        effective_sources_file,
+                        spec,
+                        builtin_defaults=inherited_sources,
+                    )
+                )
+            for spec in args.add_source:
+                print(
+                    add_default_source(
+                        effective_sources_file,
+                        spec,
+                        default_mode=args.source_mode,
+                        builtin_defaults=inherited_sources,
+                    )
+                )
+            active_sources, removed_defaults = load_sync_sources(
+                dokumente_dir=args.dokumente,
+                zotero_dir=args.zotero,
+                cli_add_sources=args.source,
+                cli_skip_sources=args.skip_source,
+                sources_file=effective_sources_file,
+                require_sources_file=explicit_sources_file
+                and not (args.add_source or args.remove_source),
+                extra_sources_files=extra_sources_files,
+            )
+        except (OSError, PermissionError, UnicodeDecodeError, ValueError) as exc:
+            print(
+                f"FEHLER bei der Verwaltung der Standardpfade: {safe_str(exc)}",
+                file=sys.stderr,
+            )
+            return 2
+        _print_sources_summary(active_sources, removed_defaults, effective_sources_file)
+        return 0
 
     if args.file_conflict_strategy == "replace" and not args.allow_trash:
         print(
@@ -2136,6 +2646,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     ok_bin, resolved_proton_bin, bin_err = validate_proton_binary(args.proton_bin)
     if not ok_bin or resolved_proton_bin is None:
         print(f"FEHLER: {bin_err}", file=sys.stderr)
+        return 2
+
+    try:
+        active_sources, _ = load_sync_sources(
+            dokumente_dir=args.dokumente,
+            zotero_dir=args.zotero,
+            cli_add_sources=args.source,
+            cli_skip_sources=args.skip_source,
+            sources_file=effective_sources_file,
+            require_sources_file=explicit_sources_file,
+            extra_sources_files=extra_sources_files,
+        )
+    except (OSError, PermissionError, UnicodeDecodeError, ValueError) as exc:
+        print(
+            f"FEHLER beim Laden der Standardpfade (Fail-Closed-Abbruch): {safe_str(exc)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not active_sources:
+        print(
+            "FEHLER: Keine aktiven Standardpfade zum Synchronisieren konfiguriert "
+            "(prüfe sources.txt bzw. --add-source / --source).",
+            file=sys.stderr,
+        )
         return 2
 
     explicit_exclude = args.exclude_file is not None
@@ -2153,7 +2688,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 DEFAULT_LOCAL_EXCLUDE_FILE,
             ),
         )
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, PermissionError, UnicodeDecodeError, ValueError) as exc:
         print(
             f"FEHLER beim Laden der Ausschlussdatei (Fail-Closed-Abbruch): {safe_str(exc)}",
             file=sys.stderr,
@@ -2167,6 +2702,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args=args,
                 proton_bin=resolved_proton_bin,
                 exclude_patterns=exclude_patterns,
+                active_sources=active_sources,
             )
     except RuntimeError as exc:
         print(f"FEHLER: {safe_str(exc)}", file=sys.stderr)
@@ -2181,13 +2717,10 @@ def _run_sync_session(
     args: argparse.Namespace,
     proton_bin: str,
     exclude_patterns: Sequence[str],
+    active_sources: Sequence[SyncSource],
 ) -> int:
-    raw_dok = args.dokumente.expanduser()
-    raw_zot = args.zotero.expanduser()
-    resolved_dok = raw_dok.resolve()
-    resolved_zot = raw_zot.resolve()
-    base_dirs = [raw_dok, raw_zot]
-    allowed_roots = [resolved_dok, resolved_zot]
+    base_dirs = [src.path.expanduser() for src in active_sources]
+    allowed_roots = [src.path.expanduser().resolve() for src in active_sources]
 
     allowed_devs: Set[int] = set()
     if not args.cross_filesystems:
@@ -2220,12 +2753,11 @@ def _run_sync_session(
             )
 
     targets = collect_sync_targets(
-        dokumente_dir=raw_dok,
-        zotero_dir=raw_zot,
         include_hidden=args.include_hidden,
         stats=stats,
         exclude_patterns=exclude_patterns,
         allowed_devs=frozenset(allowed_devs),
+        sources=active_sources,
     )
 
     if args.only:
@@ -2239,17 +2771,22 @@ def _run_sync_session(
             return 2
 
     locked_skip_files: Set[Path] = set()
-    if not args.allow_live_zotero and any(t[0] == resolved_zot for t in targets):
-        zotero_reason = zotero_db_state(resolved_zot)
-        if zotero_reason:
-            for side_name in ZOTERO_SQLITE_SIDE_FILES:
-                candidate = resolved_zot / side_name
-                if os.path.lexists(candidate):
-                    locked_skip_files.add(candidate.resolve())
-            stats.warnings.append(
-                f"zotero.sqlite* übersprungen ({zotero_reason}), um korrupte Backups zu "
-                "verhindern (--allow-live-zotero zum Erzwingen)."
-            )
+    if not args.allow_live_zotero:
+        checked_zotero_dirs: Set[Path] = set()
+        for target_dir, _, _ in targets:
+            if target_dir in checked_zotero_dirs:
+                continue
+            checked_zotero_dirs.add(target_dir)
+            zotero_reason = zotero_db_state(target_dir)
+            if zotero_reason:
+                for side_name in ZOTERO_SQLITE_SIDE_FILES:
+                    candidate = target_dir / side_name
+                    if os.path.lexists(candidate):
+                        locked_skip_files.add(candidate.resolve())
+                stats.warnings.append(
+                    f"zotero.sqlite* in {safe_str(target_dir)} übersprungen ({zotero_reason}), um korrupte Backups zu "
+                    "verhindern (--allow-live-zotero zum Erzwingen)."
+                )
 
     policy = ScanPolicy(
         include_hidden=args.include_hidden,
@@ -2265,10 +2802,14 @@ def _run_sync_session(
 
     mode_label = "TROCKENLAUF (DRY-RUN)" if args.dry_run else "LIVE-SYNCHRONISATION"
     print(f"=== Proton Drive Synchronisation ({mode_label}) ===")
-    print(
-        f"Dokumente-Quelle : {safe_str(resolved_dok)} (nur Unterordner, keine losen Dateien)"
-    )
-    print(f"Zotero-Quelle    : {safe_str(resolved_zot)}")
+    for src in active_sources:
+        resolved_src = src.path.expanduser().resolve()
+        mode_desc = (
+            "nur Unterordner, keine losen Dateien"
+            if src.mode == "subfolders"
+            else "kompletter Ordner inkl. loser Dateien"
+        )
+        print(f"Quelle ({src.mode:<10}): {safe_str(resolved_src)} ({mode_desc})")
     print(f"Cloud-Ziel       : {REMOTE_ROOT}")
     print(f"Proton-Binary    : {safe_str(proton_bin)}")
     print(
@@ -2283,7 +2824,7 @@ def _run_sync_session(
     if stats.ignored_loose_files:
         ignored_names = ", ".join(safe_str(p.name) for p in stats.ignored_loose_files)
         print(
-            f"Ignorierte lose Dateien in {safe_str(resolved_dok)} "
+            f"Ignorierte lose Dateien in 'subfolders'-Quellen "
             f"({len(stats.ignored_loose_files)}): {ignored_names}"
         )
     print()
@@ -2367,7 +2908,7 @@ def _run_sync_session(
     print(f"Aktualisierte Dateien (PC > Cloud)    : {stats.updated_files}")
     print(f"Übersprungen (Inhalt/Hash identisch)  : {stats.skipped_identical}")
     print(f"Übersprungen (Cloud neuer/gleich alt) : {stats.skipped_remote_newer_or_equal}")
-    print(f"Ignorierte lose Dateien in Dokumente  : {len(stats.ignored_loose_files)}")
+    print(f"Ignorierte lose Dateien (subfolders)  : {len(stats.ignored_loose_files)}")
     print()
 
     if all_actions:
