@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import io
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -1027,6 +1028,21 @@ class TestHardening(unittest.TestCase):
             )
             self.assertEqual(proc2.returncode, 2)
             self.assertIn("world-writable", proc2.stderr)
+
+    def test_help_output_contains_no_local_paths_or_username(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as ctx:
+                spd.parse_args(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = out.getvalue()
+        normalized = " ".join(re.sub(r"-\s*\n\s*", "-", help_text).split())
+        self.assertNotIn(str(Path.home()), help_text)
+        self.assertNotIn(str(Path(spd.__file__).resolve().parent), help_text)
+        self.assertIn("~/Dokumente", normalized)
+        self.assertIn("~/Zotero", normalized)
+        self.assertIn("<Skript-Ordner>/sources.txt", normalized)
+        self.assertIn("<Skript-Ordner>/exclude.txt", normalized)
 
 
 if __name__ == "__main__":

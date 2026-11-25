@@ -2934,22 +2934,23 @@ def execute_upload_batches(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="sync_proton_drive.py",
         description=(
             "Synchronisiert konfigurierbare Standardordner (standardmäßig Unterordner von ~/Dokumente "
             "sowie ~/Zotero) mit Proton Drive (/my-files)."
-        )
+        ),
     )
     parser.add_argument(
         "--dokumente",
         type=Path,
         default=DEFAULT_DOKUMENTE,
-        help=f"Pfad zum Dokumente-Ordner (Standard: {DEFAULT_DOKUMENTE})",
+        help="Pfad zum Dokumente-Ordner (Standard: ~/Dokumente bzw. ~/Documents).",
     )
     parser.add_argument(
         "--zotero",
         type=Path,
         default=DEFAULT_ZOTERO,
-        help=f"Pfad zum Zotero-Ordner (Standard: {DEFAULT_ZOTERO})",
+        help="Pfad zum Zotero-Ordner (Standard: ~/Zotero).",
     )
     parser.add_argument(
         "--source",
@@ -2974,8 +2975,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            f"Explizite Datei mit Standardpfaden (Fail-Closed bei Nichtvorhandensein; "
-            f"Standard ohne Flag: {DEFAULT_SOURCES_FILE} falls vorhanden)."
+            "Explizite Datei mit Standardpfaden (Fail-Closed bei Nichtvorhandensein; "
+            "Standard ohne Flag: <Skript-Ordner>/sources.txt falls vorhanden)."
         ),
     )
     parser.add_argument(
@@ -3029,8 +3030,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            f"Explizite Datei mit Ausschlussmustern (Fail-Closed bei Nichtvorhandensein; "
-            f"Standard ohne Flag: {DEFAULT_EXCLUDE_FILE} falls vorhanden)."
+            "Explizite Datei mit Ausschlussmustern (Fail-Closed bei Nichtvorhandensein; "
+            "Standard ohne Flag: <Skript-Ordner>/exclude.txt falls vorhanden)."
         ),
     )
     parser.add_argument(
@@ -3120,7 +3121,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--proton-bin",
         type=str,
         default=PROTON_DRIVE_BIN,
-        help=f"Pfad zur proton-drive ausführbaren Datei (Standard: {PROTON_DRIVE_BIN}).",
+        help="Pfad zur proton-drive ausführbaren Datei (Standard: /usr/bin/proton-drive bzw. /usr/local/bin/proton-drive).",
     )
     return parser.parse_args(argv)
 
