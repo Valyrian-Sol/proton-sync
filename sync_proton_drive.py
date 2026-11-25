@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """
 Proton Drive Sync-Script (Einweg-Synchronisation PC -> Proton Drive)
 
@@ -100,6 +100,79 @@ STAGING_PREFIX = ".proton-sync-stage-"
 MAX_WORKERS_LIMIT = 16
 DEFAULT_LIST_TIMEOUT_SEC = 60
 FUTURE_MTIME_SKEW_TOLERANCE = datetime.timedelta(minutes=5)
+MAX_CONFIG_FILE_BYTES = 1024 * 1024
+MAX_STREAM_LINE_BYTES = 65536
+
+FORBIDDEN_TREE_SOURCE_DIRS: Tuple[Path, ...] = (
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+)
+FORBIDDEN_EXACT_SOURCE_DIRS: FrozenSet[Path] = frozenset(
+    {
+        Path("/"),
+        Path("/etc"),
+        Path("/boot"),
+        Path("/usr"),
+        Path("/var"),
+        Path("/run"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/lib"),
+        Path("/lib64"),
+    }
+)
+
+# Eingebaute Standard-Ausschlüsse für hochsensible Geheimnisse, Tresore, Tokens und
+# Browser-/Proton-Profile (insbesondere wichtig beim Synchronisieren von ~/.config).
+# Mit `--allow-sensitive` bei Bedarf explizit übersteuerbar.
+SENSITIVE_DEFAULT_EXCLUDES: Tuple[str, ...] = (
+    "*.kdbx",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    "*.env",
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.kube",
+    "~/.local/share/keyrings",
+    "~/.local/share/proton*",
+    "~/.local/state/proton*",
+    "~/.config/proton*",
+    "~/.config/Proton*",
+    "~/.config/google-chrome*",
+    "~/.config/chromium*",
+    "~/.config/BraveSoftware",
+    "~/.config/vivaldi*",
+    "~/.config/microsoft-edge*",
+    "~/.config/opera*",
+    "~/.config/Bitwarden*",
+    "~/.config/1Password*",
+    "~/.config/keepassxc",
+    "~/.config/keyrings",
+    "~/.config/gh",
+    "~/.config/glab-cli",
+    "~/.config/hub",
+    "~/.config/rclone",
+    "~/.config/gcloud",
+    "~/.config/aws",
+    "~/.config/azure",
+    "~/.config/kube",
+    "~/.config/op",
+    "~/.config/sops",
+    "~/.config/age",
+    "~/.config/gnupg",
+    "~/.config/syncthing",
+    "~/.config/Signal*",
+    "~/.config/Element*",
+    "~/.config/TelegramDesktop",
+    "~/.config/discord*",
+    "~/.config/Slack*",
+)
 
 ZOTERO_SQLITE_SIDE_FILES = frozenset(
     {
@@ -204,11 +277,88 @@ def is_safe_node_name(name: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def _verify_secure_directory_chain(
+    dir_path: Path, *, reject_leaf_symlink: bool = True
+) -> Optional[str]:
+    """
+    Prüft, ob `dir_path` und sämtliche übergeordneten Verzeichnisse bis `/`
+    einem vertrauenswürdigen Benutzer (root oder aktuellem User) gehören und
+    nicht ungeschützt world-writable (ohne Sticky-Bit) sind.
+    """
+    try:
+        lst = os.lstat(dir_path)
+    except OSError as exc:
+        return f"Verzeichnis nicht prüfbar {safe_str(dir_path)}: {safe_str(exc)}"
+
+    if reject_leaf_symlink and stat.S_ISLNK(lst.st_mode):
+        return f"Verzeichnis darf kein Symlink sein: {safe_str(dir_path)}"
+    if not stat.S_ISDIR(lst.st_mode) and not (
+        not reject_leaf_symlink and stat.S_ISLNK(lst.st_mode)
+    ):
+        return f"Kein Verzeichnis: {safe_str(dir_path)}"
+
+    allowed_uids = {0, os.geteuid()}
+    resolved = Path(os.path.realpath(dir_path))
+    cur = resolved
+    while True:
+        try:
+            st = os.stat(cur)
+        except OSError as exc:
+            return f"Verzeichnis nicht prüfbar {safe_str(cur)}: {safe_str(exc)}"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"Elternelement ist kein Verzeichnis: {safe_str(cur)}"
+        if st.st_uid not in allowed_uids:
+            return f"Unsicherer Eigentümer (UID {st.st_uid}) für Verzeichnis: {safe_str(cur)}"
+        if (st.st_mode & stat.S_IWOTH) and not (st.st_mode & stat.S_ISVTX):
+            return f"Verzeichnis ist world-writable ohne Sticky-Bit: {safe_str(cur)}"
+        if cur == cur.parent:
+            break
+        cur = cur.parent
+    return None
+
+
+def _sanitized_cli_env() -> Dict[str, str]:
+    """
+    Erzeugt eine bereinigte Prozessumgebung für `proton-drive`:
+    Entfernt Loader-/Runtime-Injection-Variablen (`LD_*`, `DOTNET_*`, `SSLKEYLOGFILE`,
+    `OPENSSL_CONF`, `PYTHON*` usw.) und setzt einen vertrauenswürdigen `PATH`.
+    """
+    blocked_exact = frozenset(
+        {
+            "SSLKEYLOGFILE",
+            "OPENSSL_CONF",
+            "OPENSSL_ENGINES",
+            "OPENSSL_MODULES",
+            "GCONV_PATH",
+            "GETCONF_DIR",
+            "HOSTALIASES",
+            "LOCALDOMAIN",
+            "RES_OPTIONS",
+        }
+    )
+    blocked_prefixes = (
+        "LD_",
+        "DYLD_",
+        "DOTNET_",
+        "CORECLR_",
+        "COR_",
+        "COMPlus_",
+        "PYTHON",
+    )
+    env: Dict[str, str] = {}
+    for key, val in os.environ.items():
+        if key in blocked_exact or any(key.startswith(p) for p in blocked_prefixes):
+            continue
+        env[key] = val
+    env["PATH"] = "/usr/bin:/bin"
+    return env
+
+
 def validate_proton_binary(path_str: str) -> Tuple[bool, Optional[str], str]:
     """
     Prüft, ob das `proton-drive` Binary existiert, ausführbar ist, einem
     vertrauenswürdigen Benutzer (root oder aktuellem User) gehört und weder
-    selbst noch im Elternordner ungeschützt world-writable ist.
+    selbst noch in der Verzeichniskette bis `/` ungeschützt world-writable ist.
     """
     if not path_str:
         return False, None, "Kein Pfad für proton-drive angegeben"
@@ -248,28 +398,11 @@ def validate_proton_binary(path_str: str) -> Tuple[bool, Optional[str], str]:
         )
 
     parent_dir = os.path.dirname(resolved) or "/"
-    try:
-        parent_st = os.stat(parent_dir)
-    except OSError as exc:
-        return (
-            False,
-            None,
-            f"Elternverzeichnis von proton-drive nicht prüfbar: {safe_str(exc)}",
-        )
-
-    if (parent_st.st_mode & stat.S_IWOTH) and not (parent_st.st_mode & stat.S_ISVTX):
-        return (
-            False,
-            None,
-            f"Elternverzeichnis des Binarys ist world-writable ohne Sticky-Bit: {safe_str(parent_dir)}",
-        )
-
-    if parent_st.st_uid not in allowed_uids:
-        return (
-            False,
-            None,
-            f"Unsicherer Eigentümer (UID {parent_st.st_uid}) für Binary-Verzeichnis: {safe_str(parent_dir)}",
-        )
+    chain_err = _verify_secure_directory_chain(
+        Path(parent_dir), reject_leaf_symlink=False
+    )
+    if chain_err:
+        return False, None, chain_err
 
     return True, resolved, ""
 
@@ -293,12 +426,25 @@ class SingleInstanceLock:
                     stat.S_ISDIR(st.st_mode)
                     and st.st_uid == uid
                     and (st.st_mode & 0o077) == 0
+                    and _verify_secure_directory_chain(
+                        Path(xdg_runtime), reject_leaf_symlink=True
+                    )
+                    is None
                 ):
                     return Path(xdg_runtime)
             except OSError:
                 pass
 
         fallback = Path.home() / ".cache" / "proton-sync"
+        ancestor = fallback
+        while not os.path.lexists(ancestor) and ancestor != ancestor.parent:
+            ancestor = ancestor.parent
+        if os.path.lexists(ancestor):
+            chain_err = _verify_secure_directory_chain(
+                ancestor, reject_leaf_symlink=False
+            )
+            if chain_err:
+                raise PermissionError(f"Unsicheres Lock-Verzeichnis: {chain_err}")
         fallback.mkdir(parents=True, mode=0o700, exist_ok=True)
         st = os.lstat(fallback)
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
@@ -307,6 +453,9 @@ class SingleInstanceLock:
             )
         if st.st_mode & 0o077:
             os.chmod(fallback, 0o700)
+        chain_err = _verify_secure_directory_chain(fallback, reject_leaf_symlink=True)
+        if chain_err:
+            raise PermissionError(f"Unsicheres Lock-Verzeichnis: {chain_err}")
         return fallback
 
     def __enter__(self) -> "SingleInstanceLock":
@@ -314,18 +463,41 @@ class SingleInstanceLock:
             return self
         lock_dir = self._select_lock_dir()
         self.lock_path = lock_dir / "proton-sync.lock"
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        self.fd = os.open(str(self.lock_path), flags, 0o600)
+        flags = (
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            os.close(self.fd)
-            self.fd = None
-            raise RuntimeError(
-                f"Es läuft bereits eine andere Instanz von proton-sync (Lock aktiv: {safe_str(self.lock_path)})."
+            fd = os.open(str(self.lock_path), flags, 0o600)
+        except OSError as exc:
+            raise PermissionError(
+                f"Lock-Datei konnte nicht sicher geöffnet werden ({safe_str(self.lock_path)}): {safe_str(exc)}"
             ) from exc
-        os.ftruncate(self.fd, 0)
-        os.write(self.fd, f"{os.getpid()}\n".encode("ascii"))
+
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+                raise PermissionError(
+                    f"Unsichere Lock-Datei (keine eigene reguläre Datei): {safe_str(self.lock_path)}"
+                )
+            os.fchmod(fd, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    f"Es läuft bereits eine andere Instanz von proton-sync (Lock aktiv: {safe_str(self.lock_path)})."
+                ) from exc
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        self.fd = fd
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -472,13 +644,28 @@ def join_remote_path(parent: str, name: str) -> str:
 def compute_digests(file_path: Path, need_sha256: bool = False) -> Tuple[str, Optional[str]]:
     sha1 = hashlib.sha1()
     sha256 = hashlib.sha256() if need_sha256 else None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     fd = os.open(str(file_path), flags)
-    with os.fdopen(fd, "rb") as f:
-        while chunk := f.read(1024 * 1024):
-            sha1.update(chunk)
-            if sha256 is not None:
-                sha256.update(chunk)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"Keine reguläre Datei: {safe_str(file_path)}")
+        with os.fdopen(fd, "rb") as f:
+            fd = -1  # os.fdopen übernimmt den Deskriptor
+            while chunk := f.read(1024 * 1024):
+                sha1.update(chunk)
+                if sha256 is not None:
+                    sha256.update(chunk)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return sha1.hexdigest().lower(), (sha256.hexdigest().lower() if sha256 else None)
 
 
@@ -517,6 +704,93 @@ def _split_cli_exclude(raw: str) -> List[str]:
     return parts
 
 
+def _open_and_read_config_text(
+    file_path: Path, required: bool, label: str = "Konfigurationsdatei"
+) -> Optional[str]:
+    """
+    Öffnet und liest eine Konfigurationsdatei Atomar/TOCTOU-sicher (ohne Symlinks,
+    ohne FIFOs, mit Eigentümer-/Rechte-/Größenprüfung über `fstat`).
+    """
+    expanded = file_path.expanduser()
+    try:
+        lst = os.lstat(expanded)
+    except FileNotFoundError:
+        if required:
+            raise FileNotFoundError(
+                f"Angegebene {label} existiert nicht: {safe_str(expanded)}"
+            )
+        return None
+
+    if stat.S_ISLNK(lst.st_mode):
+        raise PermissionError(f"{label} darf kein Symlink sein: {safe_str(expanded)}")
+    if stat.S_ISDIR(lst.st_mode):
+        raise IsADirectoryError(
+            f"{label} ist keine reguläre Datei: {safe_str(expanded)}"
+        )
+    if not stat.S_ISREG(lst.st_mode):
+        raise PermissionError(
+            f"{label} ist keine reguläre Datei: {safe_str(expanded)}"
+        )
+
+    chain_err = _verify_secure_directory_chain(
+        expanded.parent, reject_leaf_symlink=False
+    )
+    if chain_err:
+        raise PermissionError(f"Unsicheres Verzeichnis für {label}: {chain_err}")
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(str(expanded), flags)
+    except OSError as exc:
+        if exc.errno == getattr(os.errno if hasattr(os, "errno") else None, "ELOOP", 40) or exc.errno == 40:
+            raise PermissionError(
+                f"{label} darf kein Symlink sein: {safe_str(expanded)}"
+            ) from exc
+        raise
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(
+                f"{label} ist keine reguläre Datei: {safe_str(expanded)}"
+            )
+        allowed_uids = {0, os.geteuid()}
+        if st.st_uid not in allowed_uids:
+            raise PermissionError(
+                f"Unsicherer Eigentümer (UID {st.st_uid}) für {label}: {safe_str(expanded)}"
+            )
+        if st.st_mode & stat.S_IWOTH:
+            raise PermissionError(
+                f"Unsichere Dateirechte (world-writable) für {label}: {safe_str(expanded)}"
+            )
+        if (st.st_mode & stat.S_IWGRP) and st.st_gid not in {0, os.getegid()}:
+            raise PermissionError(
+                f"Unsichere Gruppenrechte (group-writable für fremde Gruppe {st.st_gid}) für {label}: {safe_str(expanded)}"
+            )
+        if st.st_size > MAX_CONFIG_FILE_BYTES:
+            raise ValueError(
+                f"{label} überschreitet Maximalgröße ({MAX_CONFIG_FILE_BYTES} Bytes): {safe_str(expanded)}"
+            )
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw_bytes = handle.read(MAX_CONFIG_FILE_BYTES + 1)
+        if len(raw_bytes) > MAX_CONFIG_FILE_BYTES:
+            raise ValueError(
+                f"{label} überschreitet Maximalgröße ({MAX_CONFIG_FILE_BYTES} Bytes): {safe_str(expanded)}"
+            )
+        return raw_bytes.decode("utf-8")
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _read_config_lines_strict(
     file_path: Path, required: bool, label: str = "Konfigurationsdatei"
 ) -> List[str]:
@@ -524,42 +798,12 @@ def _read_config_lines_strict(
     Liest eine Konfigurationsdatei (Ausschluss- oder Quellpfaddatei) nach dem Fail-Closed-Prinzip:
     - Fehlt eine optionale Standarddatei komplett, wird `[]` zurückgegeben.
     - Fehlt eine explizit angeforderte Datei (`required=True`) oder ist eine vorhandene
-      Datei ein Verzeichnis, ein defekter Symlink oder nicht lesbar, wird ein Fehler ausgelöst.
+      Datei ein Symlink, ein Verzeichnis, zu groß oder unsicher berechtigt, wird ein Fehler ausgelöst.
     """
-    expanded = file_path.expanduser()
-    exists = expanded.exists()
-    is_link = expanded.is_symlink()
-
-    if not exists and not is_link:
-        if required:
-            raise FileNotFoundError(
-                f"Angegebene {label} existiert nicht: {safe_str(expanded)}"
-            )
+    content = _open_and_read_config_text(file_path, required=required, label=label)
+    if content is None:
         return []
-
-    if is_link and not exists:
-        raise FileNotFoundError(
-            f"{label} ist ein defekter Symlink: {safe_str(expanded)}"
-        )
-
-    if not expanded.is_file():
-        raise IsADirectoryError(
-            f"{label} ist keine reguläre Datei: {safe_str(expanded)}"
-        )
-
-    st = os.stat(expanded)
-    allowed_uids = {0, os.geteuid()}
-    if st.st_uid not in allowed_uids:
-        raise PermissionError(
-            f"Unsicherer Eigentümer (UID {st.st_uid}) für {label}: {safe_str(expanded)}"
-        )
-    if st.st_mode & stat.S_IWOTH:
-        raise PermissionError(
-            f"Unsichere Dateirechte (world-writable) für {label}: {safe_str(expanded)}"
-        )
-
     lines: List[str] = []
-    content = expanded.read_text(encoding="utf-8")
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -580,10 +824,11 @@ def load_exclude_patterns(
     *,
     require_exclude_file: bool = False,
     extra_exclude_files: Sequence[Path] = (),
+    include_sensitive_defaults: bool = False,
 ) -> List[str]:
     """
     Lädt und kombiniert alle Ordner-/Datei-Ausschlussmuster aus:
-    1. `default_excludes` (bzw. `DEFAULT_EXCLUDED_FOLDERS`)
+    1. `default_excludes` (bzw. `DEFAULT_EXCLUDED_FOLDERS`) und optional `SENSITIVE_DEFAULT_EXCLUDES`
     2. `extra_exclude_files` (optional, z. B. `~/.config/proton-sync/exclude.txt`, `exclude.local.txt`)
     3. `exclude_file` (standardmäßig `exclude.txt` im Skript-Ordner; bei `--exclude-file` Pflicht!)
     4. `cli_excludes` (`--exclude` / `-x` Parameter, auch kommagetrennt; `\\,` für literales Komma)
@@ -595,6 +840,8 @@ def load_exclude_patterns(
         if default_excludes is not None
         else list(DEFAULT_EXCLUDED_FOLDERS)
     )
+    if include_sensitive_defaults:
+        base_list.extend(SENSITIVE_DEFAULT_EXCLUDES)
     for item in base_list:
         cleaned = item.strip()
         if cleaned and cleaned not in patterns:
@@ -699,6 +946,7 @@ def is_excluded_path(
                         folder_posix == pat_posix
                         or folder_posix.startswith(pat_posix + "/")
                         or fnmatch.fnmatchcase(folder_posix, pat_posix)
+                        or fnmatch.fnmatchcase(folder_posix, pat_posix + "/*")
                     ):
                         return True, raw_pattern
             continue
@@ -716,6 +964,7 @@ def is_excluded_path(
                 rel == pattern
                 or rel.startswith(pattern + "/")
                 or fnmatch.fnmatchcase(rel, pattern)
+                or fnmatch.fnmatchcase(rel, pattern + "/*")
             ):
                 return True, raw_pattern
 
@@ -746,6 +995,24 @@ def _normalize_source_variants(path: Path) -> Set[str]:
 
 def _sources_match(path_a: Path, path_b: Path) -> bool:
     return bool(_normalize_source_variants(path_a) & _normalize_source_variants(path_b))
+
+
+def _validate_resolved_source_dir(
+    resolved_src: Path, raw_display: object
+) -> Optional[str]:
+    """Verweigert `/` sowie kritische Systemverzeichnisse als Synchronisationsquelle."""
+    if resolved_src in FORBIDDEN_EXACT_SOURCE_DIRS:
+        return (
+            f"Systemverzeichnis '{safe_str(resolved_src)}' darf nicht als Quellpfad "
+            f"verwendet werden ({safe_str(raw_display)})"
+        )
+    for forbidden in FORBIDDEN_TREE_SOURCE_DIRS:
+        if resolved_src == forbidden or forbidden in resolved_src.parents:
+            return (
+                f"System-/Kernel-Verzeichnis '{safe_str(resolved_src)}' darf nicht als Quellpfad "
+                f"verwendet werden ({safe_str(raw_display)})"
+            )
+    return None
 
 
 def parse_source_spec(raw: str, default_mode: str = "folder") -> Tuple[str, Path, str]:
@@ -801,11 +1068,14 @@ def parse_source_spec(raw: str, default_mode: str = "folder") -> Tuple[str, Path
 
     expanded_path = os.path.expanduser(path_str)
     abs_path = os.path.abspath(expanded_path)
-    resolved_path = str(Path(expanded_path).resolve())
-    if abs_path == "/" or resolved_path == "/":
+    resolved_path = Path(expanded_path).resolve()
+    if abs_path == "/" or str(resolved_path) == "/":
         raise ValueError(
             "Das Wurzelverzeichnis '/' darf nicht als Quellpfad verwendet werden"
         )
+    forbidden_err = _validate_resolved_source_dir(resolved_path, raw)
+    if forbidden_err:
+        raise ValueError(forbidden_err)
 
     return action, candidate, mode
 
@@ -888,51 +1158,70 @@ def _format_source_entry(path_str: str, mode: str) -> str:
 
 def _read_sources_raw_lines(file_path: Path) -> Tuple[List[str], bool]:
     """Liest vorhandene Rohzeilen (inkl. Kommentaren) einer Quellen-Datei (Fail-Closed)."""
-    expanded = file_path.expanduser()
-    is_link = expanded.is_symlink()
-    if is_link:
-        raise PermissionError(
-            f"Quellen-Datei darf kein Symlink sein: {safe_str(expanded)}"
-        )
-    if not expanded.exists():
+    content = _open_and_read_config_text(
+        file_path, required=False, label="Quellen-Datei"
+    )
+    if content is None:
         return [], False
-    if not expanded.is_file():
-        raise IsADirectoryError(f"Quellen-Datei ist keine reguläre Datei: {safe_str(expanded)}")
-    st = os.stat(expanded)
-    allowed_uids = {0, os.geteuid()}
-    if st.st_uid not in allowed_uids:
-        raise PermissionError(
-            f"Unsicherer Eigentümer (UID {st.st_uid}) für Quellen-Datei: {safe_str(expanded)}"
-        )
-    if st.st_mode & stat.S_IWOTH:
-        raise PermissionError(
-            f"Unsichere Dateirechte (world-writable) für Quellen-Datei: {safe_str(expanded)}"
-        )
-    return expanded.read_text(encoding="utf-8").splitlines(), True
+    return content.splitlines(), True
 
 
 def _write_sources_file_lines(file_path: Path, lines: Sequence[str]) -> None:
-    """Schreibt die Quellen-Datei atomar mit Dateirechten 0600 und Symlink-Schutz."""
+    """Schreibt die Quellen-Datei atomar mit Dateirechten 0600 und Symlink-/Ketten-Schutz."""
     expanded = file_path.expanduser()
-    if expanded.is_symlink():
+    try:
+        lst = os.lstat(expanded)
+    except FileNotFoundError:
+        lst = None
+
+    if lst is not None:
+        if stat.S_ISLNK(lst.st_mode):
+            raise PermissionError(
+                f"Quellen-Datei darf kein Symlink sein: {safe_str(expanded)}"
+            )
+        if not stat.S_ISREG(lst.st_mode):
+            raise IsADirectoryError(
+                f"Quellen-Datei ist keine reguläre Datei: {safe_str(expanded)}"
+            )
+
+    ancestor = expanded.parent
+    while not os.path.lexists(ancestor) and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    if os.path.lexists(ancestor):
+        chain_err = _verify_secure_directory_chain(
+            ancestor, reject_leaf_symlink=False
+        )
+        if chain_err:
+            raise PermissionError(
+                f"Unsicheres Zielverzeichnis für Quellen-Datei: {chain_err}"
+            )
+
+    expanded.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    chain_err = _verify_secure_directory_chain(
+        expanded.parent, reject_leaf_symlink=False
+    )
+    if chain_err:
         raise PermissionError(
-            f"Quellen-Datei darf kein Symlink sein: {safe_str(expanded)}"
+            f"Unsicheres Zielverzeichnis für Quellen-Datei: {chain_err}"
         )
-    if expanded.exists() and not expanded.is_file():
-        raise IsADirectoryError(
-            f"Quellen-Datei ist keine reguläre Datei: {safe_str(expanded)}"
-        )
-    expanded.parent.mkdir(parents=True, exist_ok=True)
+
     content = "\n".join(lines) + ("\n" if lines else "")
     fd, tmp_name = tempfile.mkstemp(prefix=".sources-tmp-", dir=str(expanded.parent))
     tmp_path = Path(tmp_name)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, expanded)
     except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             tmp_path.unlink()
         except OSError:
@@ -1215,11 +1504,20 @@ def plan_new_folder_with_exclusions(
                 f"Konnte lokalen Ordner nicht lesen {safe_str(current)}: {safe_str(exc)}"
             )
             continue
+        seen_nfc: Dict[str, Path] = {}
         for child in children:
             result = classify_entry(child, policy, stats)
             if result is None:
                 continue
             kind, st = result
+            nfc_name = unicodedata.normalize("NFC", child.name)
+            if nfc_name in seen_nfc:
+                stats.errors.append(
+                    f"Unicode-Namenskollision (NFC/NFD) in {safe_str(current)}: "
+                    f"{safe_str(seen_nfc[nfc_name].name)} vs. {safe_str(child.name)}"
+                )
+                continue
+            seen_nfc[nfc_name] = child
             child_rel = f"{rel}/{child.name}" if rel else child.name
             if kind == "dir":
                 key = (st.st_dev, st.st_ino)
@@ -1279,6 +1577,7 @@ def list_remote_directory(
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,
+                env=_sanitized_cli_env(),
             )
         except subprocess.TimeoutExpired:
             last_err = f"Zeitüberschreitung nach {timeout_sec}s"
@@ -1419,6 +1718,11 @@ def collect_sync_targets(
 
         if not (resolved_src.exists() and resolved_src.is_dir()):
             stats.errors.append(f"Quellordner nicht gefunden: {safe_str(source.path)}")
+            continue
+
+        forbidden_err = _validate_resolved_source_dir(resolved_src, source.path)
+        if forbidden_err:
+            stats.errors.append(forbidden_err)
             continue
 
         if source.mode == "subfolders":
@@ -1638,11 +1942,20 @@ def plan_directory_sync(
                 )
                 continue
 
+            seen_nfc_dir: Dict[str, Path] = {}
             for child in children:
                 result = classify_entry(child, policy, stats)
                 if result is None:
                     continue
                 kind, child_st = result
+                nfc_name = unicodedata.normalize("NFC", child.name)
+                if nfc_name in seen_nfc_dir:
+                    stats.errors.append(
+                        f"Unicode-Namenskollision (NFC/NFD) in {safe_str(l_dir)}: "
+                        f"{safe_str(seen_nfc_dir[nfc_name].name)} vs. {safe_str(child.name)}"
+                    )
+                    continue
+                seen_nfc_dir[nfc_name] = child
                 remote_node = remote_entries.get(child.name)
 
                 if kind == "dir":
@@ -1833,35 +2146,240 @@ def verify_action_before_execution(
     return True, ""
 
 
-def _remove_staging_tree(path: Path) -> List[str]:
-    """
-    Entfernt einen Staging-Bereich. Er enthält ausschließlich selbst angelegte Ordner und
-    Hardlinks – das Entfernen eines Hardlinks löscht niemals die Originaldatei.
-    Symlinks werden nie verfolgt.
-    """
-    errors: List[str] = []
-    if not os.path.lexists(path):
-        return errors
-    for dirpath, dirnames, filenames in os.walk(path, topdown=False, followlinks=False):
-        for fname in filenames:
-            try:
-                os.unlink(os.path.join(dirpath, fname))
-            except OSError as exc:
-                errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
-        for dname in dirnames:
-            dpath = os.path.join(dirpath, dname)
-            try:
-                if os.path.islink(dpath):
-                    os.unlink(dpath)
-                else:
-                    os.rmdir(dpath)
-            except OSError as exc:
-                errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+def _empty_dir_fd(dir_fd: int, errors: List[str]) -> None:
+    """Leert ein Verzeichnis ausschließlich über `dir_fd` ohne Pfad-Traversierung."""
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    uid = os.geteuid()
+    entries: List[Tuple[str, bool]] = []
     try:
-        os.rmdir(path)
+        dup_fd = os.dup(dir_fd)
     except OSError as exc:
         errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+        return
+    try:
+        with os.scandir(dup_fd) as it:
+            dup_fd = -1  # scandir schließt dup_fd beim Beenden
+            for entry in it:
+                entries.append((entry.name, entry.is_dir(follow_symlinks=False)))
+    except OSError as exc:
+        errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+        return
+    finally:
+        if dup_fd >= 0:
+            try:
+                os.close(dup_fd)
+            except OSError:
+                pass
+
+    for name, is_dir in entries:
+        if is_dir:
+            child_fd = -1
+            try:
+                child_fd = os.open(name, dir_flags, dir_fd=dir_fd)
+                child_st = os.fstat(child_fd)
+                if not stat.S_ISDIR(child_st.st_mode) or child_st.st_uid != uid:
+                    errors.append(
+                        f"Staging-Aufräumen verweigert (unsicheres Unterverzeichnis): {safe_str(name)}"
+                    )
+                    continue
+                _empty_dir_fd(child_fd, errors)
+            except OSError as exc:
+                errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+                continue
+            finally:
+                if child_fd >= 0:
+                    try:
+                        os.close(child_fd)
+                    except OSError:
+                        pass
+            try:
+                os.rmdir(name, dir_fd=dir_fd)
+            except OSError as exc:
+                errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+        else:
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except OSError as exc:
+                errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+
+
+def _remove_staging_tree(path: Path) -> List[str]:
+    """
+    Entfernt einen privaten Staging-Bereich über Deskriptor-gebundene `dir_fd`-Aufrufe
+    (`O_NOFOLLOW`), sodass Symlink-Tausch-Angriffe während des Aufräumens keine fremden
+    Dateien oder Verzeichnisse außerhalb des Stagings löschen können.
+    """
+    errors: List[str] = []
+    try:
+        lst = os.lstat(path)
+    except FileNotFoundError:
+        return errors
+    except OSError as exc:
+        return [f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}"]
+
+    uid = os.geteuid()
+    if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode) or lst.st_uid != uid:
+        return [f"Staging-Aufräumen verweigert (unsicheres Ziel): {safe_str(path)}"]
+
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    top_fd = -1
+    try:
+        top_fd = os.open(str(path), dir_flags)
+        fst = os.fstat(top_fd)
+        if (
+            not stat.S_ISDIR(fst.st_mode)
+            or fst.st_uid != uid
+            or (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino)
+        ):
+            return [f"Staging-Aufräumen verweigert (Ziel verändert): {safe_str(path)}"]
+        _empty_dir_fd(top_fd, errors)
+    except OSError as exc:
+        errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
+    finally:
+        if top_fd >= 0:
+            try:
+                os.close(top_fd)
+            except OSError:
+                pass
+
+    if not errors:
+        try:
+            os.rmdir(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"Staging-Aufräumen fehlgeschlagen: {safe_str(exc)}")
     return errors
+
+
+def _stage_verified_file(
+    src: Path,
+    dst: Path,
+    dev: int,
+    ino: int,
+    allowed_roots: Sequence[Path] = (),
+) -> None:
+    """
+    Stellt `dst` im privaten Staging-Bereich bereit:
+    1. Bevorzugt Hardlink (`os.link(..., follow_symlinks=False)`) mit Vor- und Nachher-Inode-Prüfung.
+    2. Fällt bei `EXDEV`, `EPERM` (`protected_hardlinks`), `EMLINK` o. ä. sicher auf eine
+       FD-verifizierte Kopie (`O_RDONLY | O_NOFOLLOW | O_NONBLOCK` + `fstat`) zurück, statt
+       jemals den ungeschützten Live-Quellpfad an `proton-drive` durchzureichen.
+    """
+    if allowed_roots:
+        parent_err = _check_parents_not_symlinks(src, allowed_roots)
+        if parent_err:
+            raise ToctouError(parent_err)
+    _verify_file_identity(src, dev, ino)
+
+    try:
+        os.link(src, dst, follow_symlinks=False)
+    except OSError:
+        # Sicherer FD-verifizierter Kopier-Fallback (kein Fallback auf Live-Quellpfade!)
+        src_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            src_fd = os.open(str(src), src_flags)
+        except FileNotFoundError as exc:
+            raise ToctouError(
+                f"Lokale Datei vor Staging verschwunden {safe_str(src)}: {safe_str(exc)}"
+            ) from exc
+        except OSError as exc:
+            if exc.errno == 40:  # ELOOP (Symlink)
+                raise ToctouError(
+                    f"TOCTOU-Schutz: {safe_str(src)} wurde durch einen Symlink ersetzt!"
+                ) from exc
+            raise
+
+        dst_fd = -1
+        dst_created = False
+        try:
+            src_st = os.fstat(src_fd)
+            if not stat.S_ISREG(src_st.st_mode):
+                raise ToctouError(
+                    f"TOCTOU-Schutz: {safe_str(src)} ist keine reguläre Datei mehr!"
+                )
+            if ino and (src_st.st_dev, src_st.st_ino) != (dev, ino):
+                raise ToctouError(
+                    f"TOCTOU-Schutz: {safe_str(src)} wurde seit dem Scan durch eine andere Datei ersetzt!"
+                )
+            if allowed_roots:
+                parent_err = _check_parents_not_symlinks(src, allowed_roots)
+                if parent_err:
+                    raise ToctouError(parent_err)
+
+            dst_flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            dst_fd = os.open(str(dst), dst_flags, 0o600)
+            dst_created = True
+            with os.fdopen(src_fd, "rb") as src_f, os.fdopen(dst_fd, "wb") as dst_f:
+                src_fd = -1
+                dst_fd = -1
+                while chunk := src_f.read(1024 * 1024):
+                    dst_f.write(chunk)
+                dst_f.flush()
+            try:
+                os.utime(
+                    dst,
+                    ns=(src_st.st_atime_ns, src_st.st_mtime_ns),
+                    follow_symlinks=False,
+                )
+            except (OSError, NotImplementedError):
+                pass
+            return
+        except BaseException:
+            if dst_created:
+                try:
+                    os.unlink(dst)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if src_fd >= 0:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
+            if dst_fd >= 0:
+                try:
+                    os.close(dst_fd)
+                except OSError:
+                    pass
+
+    st = os.lstat(dst)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or (
+        ino and (st.st_dev, st.st_ino) != (dev, ino)
+    ):
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise ToctouError(
+            f"TOCTOU-Schutz: {safe_str(src)} wurde während des Stagings ausgetauscht!"
+        )
+    if allowed_roots:
+        parent_err = _check_parents_not_symlinks(src, allowed_roots)
+        if parent_err:
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+            raise ToctouError(parent_err)
 
 
 def _link_verified(
@@ -1871,44 +2389,55 @@ def _link_verified(
     ino: int,
     allowed_roots: Sequence[Path] = (),
 ) -> None:
-    """
-    Legt `dst` als Hardlink auf `src` an und stellt vorher UND nachher sicher, dass exakt
-    der beim Scan geprüfte Inode verlinkt wurde und kein Elternordner zum Symlink wurde.
-    Wird `src` dazwischen gegen einen Symlink oder eine andere Datei getauscht, schlägt
-    der Abgleich fehl (ToctouError). Andere Fehler (z. B. EXDEV, EPERM) werden als OSError weitergereicht.
-    """
-    if allowed_roots:
-        parent_err = _check_parents_not_symlinks(src, allowed_roots)
-        if parent_err:
-            raise ToctouError(parent_err)
-    _verify_file_identity(src, dev, ino)
-    os.link(src, dst, follow_symlinks=False)
-    st = os.lstat(dst)
-    if stat.S_ISLNK(st.st_mode) or (st.st_dev, st.st_ino) != (dev, ino):
-        os.unlink(dst)
-        raise ToctouError(
-            f"TOCTOU-Schutz: {safe_str(src)} wurde während des Stagings ausgetauscht!"
-        )
+    """Rückwärtskompatibler Alias für `_stage_verified_file`."""
+    _stage_verified_file(src, dst, dev, ino, allowed_roots=allowed_roots)
 
 
 def _private_cache_dir() -> Optional[Path]:
-    cache_dir = Path.home() / ".cache" / "proton-sync"
-    try:
-        cache_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        st = os.lstat(cache_dir)
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
-            return None
-        if st.st_mode & 0o077:
-            os.chmod(cache_dir, 0o700)
-        return cache_dir
-    except OSError:
-        return None
+    candidates: List[Path] = []
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg_cache and os.path.isabs(xdg_cache):
+        candidates.append(Path(xdg_cache) / "proton-sync")
+    candidates.append(Path.home() / ".cache" / "proton-sync")
+
+    uid = os.geteuid()
+    for cache_dir in candidates:
+        try:
+            ancestor = cache_dir
+            while not os.path.lexists(ancestor) and ancestor != ancestor.parent:
+                ancestor = ancestor.parent
+            if os.path.lexists(ancestor):
+                if (
+                    _verify_secure_directory_chain(
+                        ancestor, reject_leaf_symlink=False
+                    )
+                    is not None
+                ):
+                    continue
+            cache_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            st = os.lstat(cache_dir)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                continue
+            if st.st_mode & 0o077:
+                os.chmod(cache_dir, 0o700)
+            if (
+                _verify_secure_directory_chain(
+                    cache_dir, reject_leaf_symlink=True
+                )
+                is not None
+            ):
+                continue
+            return cache_dir
+        except OSError:
+            continue
+    return None
 
 
 class StagingArea:
     """
-    Privater Staging-Bereich (`0700`, zufälliger Name) aus Hardlinks auf demselben
-    Dateisystem (bevorzugt unter `~/.cache/proton-sync`, sonst in der Quellwurzel).
+    Privater Staging-Bereich (`0700`, zufälliger Name) ausschließlich unter einem
+    vertrauenswürdigen privaten Verzeichnis (`~/.cache/proton-sync` bzw. Lock-Verzeichnis)
+    – niemals innerhalb der synchronisierten Quellordner.
     `proton-drive` erhält nur Pfade in diesem Bereich, sodass nachträglich in die
     echten Ordner gelegte Dateien/Symlinks niemals mit hochgeladen werden.
     """
@@ -1916,46 +2445,74 @@ class StagingArea:
     def __init__(self, roots: Sequence[Path], enabled: bool = True) -> None:
         self.roots = [Path(r) for r in roots]
         self.enabled = enabled
-        self._base_dirs: Dict[int, Path] = {}
-        self._failed_devs: Set[int] = set()
+        self._base_dir: Optional[Path] = None
+        self._failed = False
         self._counter = 0
 
-    def _base_for_dev(self, dev: int) -> Optional[Path]:
-        if not self.enabled or dev in self._failed_devs:
+    def _get_base_dir(self) -> Optional[Path]:
+        if not self.enabled or self._failed:
             return None
-        if dev in self._base_dirs:
-            return self._base_dirs[dev]
+        if self._base_dir is not None:
+            return self._base_dir
 
         candidates: List[Path] = []
         cache_dir = _private_cache_dir()
         if cache_dir is not None:
             candidates.append(cache_dir)
-        candidates.extend(self.roots)
+        try:
+            lock_dir = SingleInstanceLock._select_lock_dir()
+            if lock_dir not in candidates:
+                candidates.append(lock_dir)
+        except (OSError, PermissionError):
+            pass
 
-        for root in candidates:
+        uid = os.geteuid()
+        for priv_dir in candidates:
+            if (
+                _verify_secure_directory_chain(priv_dir, reject_leaf_symlink=True)
+                is not None
+            ):
+                continue
             try:
-                st = os.lstat(root)
+                base = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=str(priv_dir)))
             except OSError:
                 continue
-            if not stat.S_ISDIR(st.st_mode) or st.st_dev != dev:
-                continue
             try:
-                base = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=str(root)))
+                os.chmod(base, 0o700)
+                st = os.lstat(base)
+                if (
+                    not stat.S_ISDIR(st.st_mode)
+                    or st.st_uid != uid
+                    or (st.st_mode & 0o077) != 0
+                ):
+                    _remove_staging_tree(base)
+                    continue
             except OSError:
+                _remove_staging_tree(base)
                 continue
-            self._base_dirs[dev] = base
+            self._base_dir = base
             return base
-        self._failed_devs.add(dev)
+
+        self._failed = True
         return None
 
-    def new_slot(self, dev: int) -> Optional[Path]:
-        base = self._base_for_dev(dev)
+    def new_slot(self, dev: int = 0) -> Optional[Path]:
+        _ = dev  # Signatur-Kompatibilität; Staging nutzt immer privaten Bereich + FD-Fallback
+        base = self._get_base_dir()
         if base is None:
             return None
         self._counter += 1
         slot = base / f"{self._counter:06d}"
         try:
             slot.mkdir(mode=0o700)
+            st = os.lstat(slot)
+            if (
+                not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.geteuid()
+                or (st.st_mode & 0o077) != 0
+            ):
+                _remove_staging_tree(slot)
+                return None
         except OSError:
             return None
         return slot
@@ -1966,11 +2523,11 @@ class StagingArea:
         return _remove_staging_tree(slot)
 
     def cleanup(self) -> List[str]:
-        errors: List[str] = []
-        for base in list(self._base_dirs.values()):
-            errors.extend(_remove_staging_tree(base))
-        self._base_dirs.clear()
-        return errors
+        if self._base_dir is None:
+            return []
+        errs = _remove_staging_tree(self._base_dir)
+        self._base_dir = None
+        return errs
 
     def __enter__(self) -> "StagingArea":
         return self
@@ -2007,6 +2564,7 @@ def run_cli_streaming(cmd: Sequence[str], timeout_sec: Optional[int] = None) -> 
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=_sanitized_cli_env(),
     )
     timed_out = threading.Event()
 
@@ -2047,6 +2605,9 @@ def run_cli_streaming(cmd: Sequence[str], timeout_sec: Optional[int] = None) -> 
             buf = parts.pop()
             for part in parts:
                 _emit(part)
+            if len(buf) > MAX_STREAM_LINE_BYTES:
+                _emit(buf[:MAX_STREAM_LINE_BYTES])
+                buf = buf[MAX_STREAM_LINE_BYTES:]
         if buf:
             _emit(buf)
         returncode = proc.wait()
@@ -2132,9 +2693,14 @@ def _execute_new_tree(
     if not ok:
         return [err]
 
-    # 1. Bevorzugt: kompletter Upload aus dem privaten Hardlink-Staging (ein CLI-Aufruf)
-    slot = staging.new_slot(action.dev) if staging is not None else None
-    if slot is not None:
+    # 1. Bevorzugt: kompletter Upload aus dem privaten Staging (ein CLI-Aufruf; kein ungeschützter Fallback)
+    if staging is not None:
+        slot = staging.new_slot(action.dev)
+        if slot is None:
+            return [
+                f"Staging-Bereich konnte nicht sicher angelegt werden – Upload von "
+                f"{safe_str(action.local_path)} abgebrochen."
+            ]
         staged_errors: List[str] = []
         tree_root = slot / action.target_name
         try:
@@ -2145,29 +2711,27 @@ def _execute_new_tree(
                     dst.mkdir(mode=0o700, parents=True, exist_ok=True)
                     continue
                 dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                try:
-                    _link_verified(
-                        action.local_path / member.rel,
-                        dst,
-                        member.dev,
-                        member.ino,
-                        allowed_roots=allowed_roots,
-                    )
-                except ToctouError as exc:
-                    staged_errors.append(str(exc))
-        except OSError:
-            # z. B. EXDEV (Mitglied auf anderem Dateisystem) oder EPERM (protected_hardlinks)
-            staging.discard(slot)
-        else:
-            upload_err = _cli_upload(
-                proton_bin, conflict_strategy, [str(tree_root)], action.remote_parent, timeout_sec
-            )
+                _stage_verified_file(
+                    action.local_path / member.rel,
+                    dst,
+                    member.dev,
+                    member.ino,
+                    allowed_roots=allowed_roots,
+                )
+        except (ToctouError, OSError) as exc:
+            staged_errors.append(str(exc))
             staged_errors.extend(staging.discard(slot))
-            if upload_err:
-                staged_errors.append(upload_err)
             return staged_errors
 
-    # 2. Fallback ohne Staging: Ordner einzeln anlegen, Dateien einzeln verifiziert hochladen
+        upload_err = _cli_upload(
+            proton_bin, conflict_strategy, [str(tree_root)], action.remote_parent, timeout_sec
+        )
+        staged_errors.extend(staging.discard(slot))
+        if upload_err:
+            staged_errors.append(upload_err)
+        return staged_errors
+
+    # 2. Expliziter Modus ohne Staging (--no-staging): Ordner einzeln anlegen, Dateien verifiziert hochladen
     errors: List[str] = []
     try:
         remote_root = join_remote_path(action.remote_parent, action.target_name)
@@ -2234,36 +2798,41 @@ def _execute_file_batch(
 ) -> List[str]:
     errors: List[str] = []
     upload_paths: List[str] = []
-    slots: Dict[int, Optional[Path]] = {}
+    slot: Optional[Path] = None
 
-    for action in batch:
+    if staging is not None:
+        slot = staging.new_slot(batch[0].dev if batch else 0)
+        if slot is None:
+            return [
+                f"Staging-Bereich konnte nicht sicher angelegt werden – Datei-Batch für "
+                f"{safe_str(remote_parent)} abgebrochen."
+            ]
+
+    for idx, action in enumerate(batch):
         ok, err = verify_action_before_execution(action, allowed_roots)
         if not ok:
             errors.append(err)
             continue
 
-        staged_path: Optional[Path] = None
         if staging is not None:
-            if action.dev not in slots:
-                slots[action.dev] = staging.new_slot(action.dev)
-            slot = slots[action.dev]
-            if slot is not None:
-                dst = slot / action.target_name
-                try:
-                    _link_verified(
-                        action.local_path,
-                        dst,
-                        action.dev,
-                        action.ino,
-                        allowed_roots=allowed_roots,
-                    )
-                    staged_path = dst
-                except ToctouError as exc:
-                    errors.append(str(exc))
-                    continue
-                except OSError:
-                    staged_path = None  # Fallback auf direkten, frisch verifizierten Pfad
-        upload_paths.append(str(staged_path or action.local_path))
+            assert slot is not None
+            sub = slot / f"{idx:04d}"
+            try:
+                sub.mkdir(mode=0o700)
+                dst = sub / action.target_name
+                _stage_verified_file(
+                    action.local_path,
+                    dst,
+                    action.dev,
+                    action.ino,
+                    allowed_roots=allowed_roots,
+                )
+            except (ToctouError, OSError) as exc:
+                errors.append(str(exc))
+                continue
+            upload_paths.append(str(dst))
+        else:
+            upload_paths.append(str(action.local_path))
 
     try:
         if upload_paths:
@@ -2273,9 +2842,8 @@ def _execute_file_batch(
             if upload_err:
                 errors.append(upload_err)
     finally:
-        if staging is not None:
-            for slot in slots.values():
-                errors.extend(staging.discard(slot))
+        if slot is not None and staging is not None:
+            errors.extend(staging.discard(slot))
     return errors
 
 
@@ -2489,6 +3057,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Versteckte Dateien und Ordner (beginnend mit '.') ebenfalls synchronisieren.",
     )
     parser.add_argument(
+        "--allow-sensitive",
+        action="store_true",
+        help=(
+            "Deaktiviert die eingebauten Sicherheits-Ausschlüsse für Schlüssel, Tresore, "
+            "Browser-Profile und Proton-/CLI-Tokens (`SENSITIVE_DEFAULT_EXCLUDES`)."
+        ),
+    )
+    parser.add_argument(
         "--allow-hardlinks",
         action="store_true",
         help="Dateien mit mehreren Hardlinks ebenfalls hochladen (Standard: überspringen).",
@@ -2687,6 +3263,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 DEFAULT_USER_EXCLUDE_FILE,
                 DEFAULT_LOCAL_EXCLUDE_FILE,
             ),
+            include_sensitive_defaults=not args.allow_sensitive,
         )
     except (OSError, PermissionError, UnicodeDecodeError, ValueError) as exc:
         print(
@@ -2719,8 +3296,16 @@ def _run_sync_session(
     exclude_patterns: Sequence[str],
     active_sources: Sequence[SyncSource],
 ) -> int:
-    base_dirs = [src.path.expanduser() for src in active_sources]
-    allowed_roots = [src.path.expanduser().resolve() for src in active_sources]
+    stats = SyncStats()
+    base_dirs: List[Path] = []
+    allowed_roots: List[Path] = []
+    for src in active_sources:
+        expanded = src.path.expanduser()
+        resolved = expanded.resolve()
+        if _validate_resolved_source_dir(resolved, src.path) is not None:
+            continue
+        base_dirs.append(expanded)
+        allowed_roots.append(resolved)
 
     allowed_devs: Set[int] = set()
     if not args.cross_filesystems:
@@ -2730,27 +3315,27 @@ def _run_sync_session(
             except OSError:
                 pass
 
-    stats = SyncStats()
-
-    search_staging_roots: List[Path] = list(allowed_roots)
     cache_dir = _private_cache_dir()
-    if cache_dir is not None and cache_dir not in search_staging_roots:
-        search_staging_roots.append(cache_dir)
-
-    for stale in find_stale_staging_dirs(search_staging_roots):
-        if not args.dry_run and not args.no_lock:
-            cleanup_errs = _remove_staging_tree(stale)
-            if cleanup_errs:
-                stats.warnings.extend(cleanup_errs)
+    if cache_dir is not None:
+        for stale in find_stale_staging_dirs([cache_dir]):
+            if not args.dry_run and not args.no_lock:
+                cleanup_errs = _remove_staging_tree(stale)
+                if cleanup_errs:
+                    stats.warnings.extend(cleanup_errs)
+                else:
+                    stats.warnings.append(
+                        f"Verwaister Staging-Ordner eines früheren abgebrochenen Laufs automatisch bereinigt: {safe_str(stale)}"
+                    )
             else:
                 stats.warnings.append(
-                    f"Verwaister Staging-Ordner eines früheren abgebrochenen Laufs automatisch bereinigt: {safe_str(stale)}"
+                    f"Verwaister Staging-Ordner eines abgebrochenen Laufs gefunden: {safe_str(stale)} – "
+                    "wird beim nächsten regulären Lauf mit aktivem Lock automatisch bereinigt."
                 )
-        else:
-            stats.warnings.append(
-                f"Verwaister Staging-Ordner eines abgebrochenen Laufs gefunden: {safe_str(stale)} – "
-                "wird beim nächsten regulären Lauf mit aktivem Lock automatisch bereinigt."
-            )
+
+    for stale in find_stale_staging_dirs(allowed_roots):
+        stats.warnings.append(
+            f"Unerwarteter Staging-Eintrag im Quellordner gefunden (wird nicht automatisch gelöscht): {safe_str(stale)}"
+        )
 
     targets = collect_sync_targets(
         include_hidden=args.include_hidden,

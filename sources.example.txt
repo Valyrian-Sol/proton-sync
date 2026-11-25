@@ -25,5 +25,7 @@
 #
 # Sicherheitshinweis (OPSEC) bei ~/.config:
 #   In ~/.config liegen häufig auch Browser-Profile oder CLI-Tokens (z. B. gh, rclone,
-#   proton-drive). Prüfe vor dem ersten Live-Upload mit `./sync.sh --dry-run` und
-#   schließe sensible Unterordner bei Bedarf in `exclude.txt` aus.
+#   proton-drive). Die wichtigsten sensitiven Pfade sind zwar über
+#   `SENSITIVE_DEFAULT_EXCLUDES` standardmäßig ausgeschlossen, dennoch solltest du vor
+#   dem ersten Live-Upload mit `./sync.sh --dry-run` prüfen und weitere eigene
+#   sensible Unterordner bei Bedarf in `exclude.txt` ausschließen.

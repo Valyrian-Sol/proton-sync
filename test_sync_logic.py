@@ -6,6 +6,8 @@ import datetime
 import hashlib
 import io
 import os
+import stat
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -792,6 +794,239 @@ class TestHardening(unittest.TestCase):
             real_src = root / "real_sources.txt"
             add_default_source(real_src, str(root / "Cfg"))
             self.assertEqual(os.stat(real_src).st_mode & 0o777, 0o600)
+
+    def test_config_files_reject_symlinks_even_to_valid_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "real.txt"
+            target.write_text("Videos\n", encoding="utf-8")
+            os.chmod(target, 0o600)
+
+            link_ex = root / "exclude.txt"
+            link_ex.symlink_to(target)
+            with self.assertRaises(PermissionError):
+                load_exclude_patterns(exclude_file=link_ex)
+
+            link_src = root / "sources.txt"
+            link_src.symlink_to(target)
+            with self.assertRaises(PermissionError):
+                load_sync_sources(
+                    dokumente_dir=root / "Dok",
+                    zotero_dir=root / "Zot",
+                    sources_file=link_src,
+                )
+
+    def test_single_instance_lock_rejects_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "run"
+            runtime_dir.mkdir(mode=0o700)
+            os.mkfifo(runtime_dir / "proton-sync.lock", 0o600)
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime_dir)}):
+                with self.assertRaises(PermissionError):
+                    with SingleInstanceLock(enabled=True):
+                        pass
+
+    def test_staging_fd_copy_fallback_and_toctou_abort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            dok = root / "Dokumente"
+            projekt = dok / "Projekt"
+            projekt.mkdir(parents=True)
+            f = projekt / "daten.txt"
+            f.write_text("geheimer-inhalt", encoding="utf-8")
+            cache_home = root / "cache"
+            cache_home.mkdir(mode=0o700)
+
+            actions = plan_new_folder_with_exclusions(
+                projekt, "/my-files", ScanPolicy(base_dirs=[dok]), SyncStats()
+            )
+            fake = FakeCli()
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home)}), mock.patch.object(
+                spd.os, "link", side_effect=PermissionError("protected_hardlinks")
+            ), mock.patch.object(spd, "run_cli_streaming", fake), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                errs = execute_upload_batches(actions, "/usr/bin/proton-drive", allowed_roots=[dok])
+
+            self.assertEqual(errs, [])
+            self.assertEqual(len(fake.calls), 1)
+            dash = fake.calls[0].index("--")
+            staged_path = Path(fake.calls[0][dash + 1])
+            self.assertIn(STAGING_PREFIX, str(staged_path))
+            self.assertNotIn(str(dok), str(staged_path))
+            self.assertEqual(fake.staged_snapshots[0], ["daten.txt"])
+
+            # Bei EXDEV in Batch-Dateien ebenfalls Staging nutzen, niemals Live-Pfad
+            st = os.lstat(f)
+            batch_action = SyncAction(
+                local_path=f,
+                remote_parent="/my-files/Projekt",
+                reason="new_file",
+                dev=st.st_dev,
+                ino=st.st_ino,
+            )
+            fake_batch = FakeCli()
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home)}), mock.patch.object(
+                spd.os, "link", side_effect=OSError(18, "Invalid cross-device link")
+            ), mock.patch.object(spd, "run_cli_streaming", fake_batch), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                errs2 = execute_upload_batches([batch_action], "/usr/bin/proton-drive", allowed_roots=[dok])
+            self.assertEqual(errs2, [])
+            batch_dash = fake_batch.calls[0].index("--")
+            self.assertIn(STAGING_PREFIX, fake_batch.calls[0][batch_dash + 1])
+
+            # TOCTOU-Tausch während new_tree-Staging muss Upload komplett abbrechen
+            f.unlink()
+            f.write_text("manipuliert", encoding="utf-8")
+            fake_abort = FakeCli()
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home)}), mock.patch.object(
+                spd, "run_cli_streaming", fake_abort
+            ), contextlib.redirect_stdout(io.StringIO()):
+                errs3 = execute_upload_batches(actions, "/usr/bin/proton-drive", allowed_roots=[dok])
+            self.assertEqual(fake_abort.calls, [])
+            self.assertTrue(any("TOCTOU" in e or "ersetzt" in e for e in errs3))
+
+    def test_remove_staging_tree_refuses_symlinks_and_handles_nested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim_dir = root / "victim"
+            victim_dir.mkdir()
+            (victim_dir / "keep.txt").write_text("wichtig", encoding="utf-8")
+
+            link_stage = root / f"{STAGING_PREFIX}link"
+            link_stage.symlink_to(victim_dir)
+            errs = spd._remove_staging_tree(link_stage)
+            self.assertTrue(errs)
+            self.assertTrue((victim_dir / "keep.txt").exists())
+
+            real_stage = root / f"{STAGING_PREFIX}real"
+            (real_stage / "sub").mkdir(parents=True)
+            (real_stage / "sub" / "file.txt").write_text("tmp", encoding="utf-8")
+            (real_stage / "sub" / "evil_link").symlink_to(victim_dir)
+            errs2 = spd._remove_staging_tree(real_stage)
+            self.assertEqual(errs2, [])
+            self.assertFalse(real_stage.exists())
+            self.assertTrue((victim_dir / "keep.txt").exists())
+
+    def test_symlinked_source_to_system_root_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dok = root / "Dokumente"
+            dok.mkdir()
+            evil_zot = root / "Zotero"
+            evil_zot.symlink_to("/etc")
+            stats = SyncStats()
+            targets = collect_sync_targets(dok, evil_zot, stats=stats)
+            self.assertEqual(targets, [])
+            self.assertTrue(any("/etc" in e for e in stats.errors))
+
+            evil_root = root / "RootLink"
+            evil_root.symlink_to("/")
+            stats2 = SyncStats()
+            targets2 = collect_sync_targets(
+                sources=[SyncSource(path=evil_root, mode="folder", origin="test")],
+                stats=stats2,
+            )
+            self.assertEqual(targets2, [])
+            self.assertTrue(any("Systemverzeichnis" in e for e in stats2.errors))
+
+    def test_sensitive_default_excludes_and_wildcard_descendants(self) -> None:
+        patterns = load_exclude_patterns(
+            exclude_file=None,
+            default_excludes=[],
+            include_sensitive_defaults=True,
+        )
+        home = Path.home()
+        self.assertTrue(
+            is_excluded_path(home / ".config" / "google-chrome" / "Default" / "Cookies", patterns, [home / ".config"])[0]
+        )
+        self.assertTrue(
+            is_excluded_path(home / ".config" / "Proton Pass" / "vault.db", patterns, [home / ".config"])[0]
+        )
+        self.assertTrue(
+            is_excluded_path(home / ".config" / "gh" / "hosts.yml", patterns, [home / ".config"])[0]
+        )
+        self.assertTrue(
+            is_excluded_path(home / "Dokumente" / "app.env", patterns, [home / "Dokumente"])[0]
+        )
+        self.assertTrue(
+            is_excluded_path(home / "Dokumente" / "Tresor.KDBX", patterns, [home / "Dokumente"])[0]
+        )
+        self.assertFalse(
+            is_excluded_path(home / "Dokumente" / "Signal" / "Notizen.txt", patterns, [home / "Dokumente"])[0]
+        )
+        self.assertFalse(
+            is_excluded_path(home / "Dokumente" / "OP" / "Bericht.pdf", patterns, [home / "Dokumente"])[0]
+        )
+
+        # Wildcard-Ordnermuster treffen auch verschachtelte Dateien
+        dok = home / "Dokumente"
+        self.assertTrue(
+            is_excluded_path(dok / "Projekte" / "Alpha" / "secrets" / "key.txt", ["Projekte/*/secrets"], [dok])[0]
+        )
+
+    def test_sanitized_cli_env_strips_injection_vars(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LD_PRELOAD": "/tmp/evil.so",
+                "LD_LIBRARY_PATH": "/tmp/evil",
+                "DOTNET_STARTUP_HOOKS": "/tmp/hook.dll",
+                "SSLKEYLOGFILE": "/tmp/keys.log",
+                "OPENSSL_CONF": "/tmp/evil.cnf",
+                "PYTHONPATH": "/tmp/evil_py",
+                "PATH": "/tmp/evil:/usr/bin",
+                "HOME": "/home/user",
+            },
+            clear=True,
+        ):
+            env = spd._sanitized_cli_env()
+        for bad in (
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DOTNET_STARTUP_HOOKS",
+            "SSLKEYLOGFILE",
+            "OPENSSL_CONF",
+            "PYTHONPATH",
+        ):
+            self.assertNotIn(bad, env)
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertEqual(env["HOME"], "/home/user")
+
+    def test_sync_sh_isolated_and_rejects_world_writable_python(self) -> None:
+        script_dir = Path(__file__).resolve().parent
+        sync_sh = script_dir / "sync.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            evil_dir = Path(tmp)
+            os.chmod(evil_dir, 0o700)
+            (evil_dir / "sitecustomize.py").write_text(
+                "raise SystemExit('PYTHONPATH-HIJACK')\n", encoding="utf-8"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(evil_dir)
+            proc = subprocess.run(
+                [str(sync_sh), "--list-sources"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertNotIn("PYTHONPATH-HIJACK", proc.stderr)
+
+            bad_py = evil_dir / "python3"
+            bad_py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(bad_py, 0o777)
+            env2 = os.environ.copy()
+            env2["PROTON_SYNC_PYTHON"] = str(bad_py)
+            proc2 = subprocess.run(
+                [str(sync_sh), "--list-sources"],
+                capture_output=True,
+                text=True,
+                env=env2,
+            )
+            self.assertEqual(proc2.returncode, 2)
+            self.assertIn("world-writable", proc2.stderr)
 
 
 if __name__ == "__main__":

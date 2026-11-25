@@ -2,6 +2,10 @@
 # Kopiere diese Vorlage nach `exclude.txt` (wird von Git ignoriert):
 #   cp exclude.example.txt exclude.txt
 #
+# Hinweis: Hochsensible Geheimnisse (*.kdbx, *.p12, SSH/GPG-Schlüssel, Browser-Profile,
+# Proton-Tokens, Cloud-CLI-Credentials, *.env) werden bereits
+# automatisch über `SENSITIVE_DEFAULT_EXCLUDES` ausgeschlossen (sofern nicht `--allow-sensitive`).
+#
 # Eine Zeile pro auszuschließendem Ordner oder Dateimuster.
 # Zeilen mit '#' sowie Leerzeilen werden ignoriert.
 #
